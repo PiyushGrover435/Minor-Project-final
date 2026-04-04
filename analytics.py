@@ -269,15 +269,35 @@ class RealtimeAnalyzer:
         # ML Gaze Head prediction
         gaze_label, gaze_vals = self.gaze_head.predict(keypoints, frame)
         
-        # ML Affective Head prediction
-        emotion, ml_level, ml_score = self.affective_head.predict(keypoints, frame)
-
         raw = self._raw_brow_eyelid_dist(keypoints)
         if raw is None:
+            # Fallback if no face
+            emotion, ml_level, ml_score = self.affective_head.predict(keypoints, frame)
             return self._make_result(gaze_label, gaze_vals, 'Low', 0.0,
                                      self.prev_integrity, emotion=emotion)
 
         eye_open = self._eye_opening_ratio(keypoints)
+        
+        # Phase 1: Micro-tremor / blink state / posture extraction for Affective Multi-Modal TCN
+        delta_brow_norm = 0.0
+        # If calibrated, measure deviation from baseline as a robust micro-tremor indicator
+        if hasattr(self, '_baseline_dist') and self._baseline_dist is not None:
+            delta_brow_norm = self._baseline_dist - raw
+            
+        blink_state = 0.0
+        if hasattr(self, 'blink_buf') and len(self.blink_buf) > 0:
+            try:
+                if float(np.median(self.blink_buf)) < self.blink_threshold:
+                    blink_state = 1.0
+            except Exception:
+                pass
+                
+        rx, ry, rz = keypoints.get('head_pose', (0.0, 0.0, 0.0))
+                
+        # ML Affective Head prediction (Multi-Modal TCN)
+        emotion, ml_level, ml_score = self.affective_head.predict(
+            keypoints, frame, temporal_geometries=(delta_brow_norm, blink_state, rx, ry, rz)
+        )
 
         # ── Calibration phase ───────────────────────────────────────
         if not self._calibrated:
@@ -328,7 +348,7 @@ class RealtimeAnalyzer:
             return self._make_result(gaze_label, gaze_vals, 'Low', smooth, integrity, emotion=emotion)
 
         # Override if ML model provides higher confidence structure
-        if self.affective_head.model is not None:
+        if hasattr(self.affective_head, 'tcn') and self.affective_head.tcn is not None:
             smooth = ml_score
             level = ml_level
         else:

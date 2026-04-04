@@ -158,6 +158,28 @@ class VisionEngine:
                 int(np.max(lm[:, 1]))  # y_max
             )
         }
+        
+        # Compute Head Pose (Rx, Ry, Rz) proxy using normalized 3D landmarks
+        try:
+            # 1 (Nose), 33 (Left Eye Outer), 263 (Right Eye Outer)
+            # Find the actual elements from the sequence whether they are protobufs or Tasks API objects
+            nose = lm_seq[1]
+            le = lm_seq[33]
+            re = lm_seq[263]
+            
+            rx = float((le.y + re.y) / 2.0 - nose.y)  # Pitch proxy
+            ry = float((le.x + re.x) / 2.0 - nose.x)  # Yaw proxy
+            rz = float(le.y - re.y)                   # Roll proxy
+            
+            # Incorporate Z if available (MediaPipe FaceLandmarker provides Z)
+            if hasattr(nose, 'z'):
+                # 3D Yaw relative to depth
+                ry = float(nose.z - (le.z + re.z)/2.0)
+                
+            keypoints['head_pose'] = (rx, ry, rz)
+        except Exception:
+            keypoints['head_pose'] = (0.0, 0.0, 0.0)
+
         # Add all named indices from the canonical map
         for name, idx in IDX.items():
             keypoints[name] = lm[idx]

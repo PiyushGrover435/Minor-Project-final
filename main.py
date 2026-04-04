@@ -11,6 +11,7 @@ import cv2
 import numpy as np
 from vision_engine import VisionEngine
 from analytics import compute_integrity, RealtimeAnalyzer
+from calibration import CalibrationEngine
 
 
 # ── Overlay colours ─────────────────────────────────────────────────
@@ -101,6 +102,7 @@ def main():
     engine   = VisionEngine()
     analyzer = RealtimeAnalyzer(window=12, calib_frames=30)
     integrity = analyzer.prev_integrity
+    calibrator = CalibrationEngine()
 
     # FPS tracking
     prev_time = time.time()
@@ -129,6 +131,9 @@ def main():
                 fps = fps * (1.0 - fps_alpha) + instant_fps * fps_alpha
 
             kp = engine.process(frame)
+            
+            # Create a display frame to manipulate (calibration UI overlays on this)
+            display_frame = frame.copy()
 
             if kp is None:
                 # No face detected — decay integrity
@@ -142,20 +147,27 @@ def main():
                     'integrity':    integrity,
                     'calibrating':  False,
                 }
-                draw_overlay(frame, {}, result, fps)
-                cv2.imshow('Sentin-Edge AI', frame)
-                if cv2.waitKey(1) & 0xFF == ord('q'):
-                    break
-                continue
+                # If calibrating, keep showing calibration UI even if face blinks out
+                display_frame, is_calib = calibrator.update_and_draw((frame.shape[0], frame.shape[1]), None, frame, analyzer.gaze_head)
+                if not is_calib:
+                    draw_overlay(display_frame, {}, result, fps)
+            else:
+                # ── Run analyser ────────────────────────────────────────
+                result = analyzer.update(kp, frame)
+                integrity = result['integrity']
 
-            # ── Run analyser ────────────────────────────────────────
-            result = analyzer.update(kp, frame)
-            integrity = result['integrity']
+                # Update calibration and check if it took over the screen
+                display_frame, is_calib = calibrator.update_and_draw((frame.shape[0], frame.shape[1]), kp, frame, analyzer.gaze_head)
+                if not is_calib:
+                    draw_overlay(display_frame, kp, result, fps)
+                    cv2.putText(display_frame, "Press 'c' to Calibrate Gaze", (10, frame.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 0), 2)
 
-            draw_overlay(frame, kp, result, fps)
-            cv2.imshow('Sentin-Edge AI', frame)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
+            cv2.imshow('Sentin-Edge AI', display_frame)
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
                 break
+            elif key == ord('c') and not calibrator.active:
+                calibrator.start()
 
     finally:
         cap.release()

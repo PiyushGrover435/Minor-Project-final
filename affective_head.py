@@ -1,95 +1,167 @@
 import os
 import cv2
+import numpy as np
 import torch
+import torch.nn as nn
 import torchvision.transforms as transforms
 from train_affective_head import EmotionCNN
 
+class MultiModalStressTCN(nn.Module):
+    """
+    1D TCN that processes the temporal sequence of concatenated features:
+    (DeepVector (256D) + BrowMicroTremor (1D) + BlinkState (1D) + HeadPose (3D)) = 261D
+    Output: Stress Score [0.0 - 1.0]
+    """
+    def __init__(self, seq_len=15, feature_dim=261):
+        super().__init__()
+        self.tcn = nn.Sequential(
+            nn.Conv1d(feature_dim, 128, kernel_size=3, padding=2, dilation=2),
+            nn.ReLU(),
+            nn.Conv1d(128, 64, kernel_size=3, padding=4, dilation=4),
+            nn.ReLU(),
+        )
+        self.regressor = nn.Sequential(
+            nn.Linear(64, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        # x is (Batch, SeqLen, FeatureDim) -> needs to be (Batch, FeatureDim, SeqLen)
+        x = x.transpose(1, 2)
+        out = self.tcn(x)
+        last_timestep = out[:, :, -1]
+        stress = self.regressor(last_timestep)
+        return stress
+
 class AffectiveHead:
     """
-    ML-based Affective Head using lightweight CNN trained on FER-2013.
+    Multi-Modal ML Affective Head.
+    Extracts deep features from a CNN (Privacy First) and fuses with temporal geometries.
     """
-    def __init__(self, model_path="models/affective_cnn.pth"):
+    def __init__(self, cnn_path="models/affective_cnn.pth", seq_len=15):
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.model = None
+        self.feature_extractor = None
+        self.seq_len = seq_len
         
-        # Mapping from class index to emotion string (from load_fer2013.py)
+        # Mapping from class index to emotion string 
         self.idx_to_class = {0: 'angry', 1: 'disgust', 2: 'fear', 3: 'happy', 4: 'neutral', 5: 'sad', 6: 'surprise'}
-        
-        # Stress mapping (binary)
         self.stress_emotions = {'angry', 'disgust', 'fear', 'sad'}
         
-        if os.path.exists(model_path):
+        # Load visual backbone
+        if os.path.exists(cnn_path):
             try:
-                self.model = EmotionCNN().to(self.device)
-                self.model.load_state_dict(torch.load(model_path, map_location=self.device, weights_only=True))
-                self.model.eval()
-                print(f"[AffectiveHead] ✅ Loaded CNN model on {self.device}.")
+                base_model = EmotionCNN().to(self.device)
+                base_model.load_state_dict(torch.load(cnn_path, map_location=self.device, weights_only=True))
+                base_model.eval()
+                
+                # Monkey-patch to extract 256D continuous vector
+                # The classifier is: Flatten, Linear(->256), ReLU, Dropout, Linear(->7)
+                modules = list(base_model.features.children()) + list(base_model.classifier.children())[:-2]
+                self.feature_extractor = nn.Sequential(*modules)
+                self.feature_extractor.eval()
+                
+                # Keep the original model strictly for legacy emotion prediction backward compatibility
+                self.legacy_model = base_model
+                print(f"[AffectiveHead] ✅ Loaded Deep Feature Extractor on {self.device}.")
             except Exception as e:
-                print(f"[AffectiveHead] ⚠️ Failed to load model: {e}")
+                print(f"[AffectiveHead] ⚠️ Failed to load CNN backbone: {e}")
+                self.legacy_model = None
         else:
-            print(f"[AffectiveHead] ⚠️ Model not found at {model_path}. Will use fallback.")
+            print(f"[AffectiveHead] ⚠️ CNN not found at {cnn_path}.")
+            self.legacy_model = None
 
         self.transform = transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.5], std=[0.5])
         ])
 
-    def predict(self, keypoints, frame=None):
-        """
-        Runs ML prediction if available.
-        Otherwise falls back to the old heuristic.
-        """
-        # 1. Fallback heuristic
-        from analytics import compute_stress
-        level, heuristic_score = compute_stress(keypoints)
+        # Stress TCN Logic
+        tcn_path = "models/stress_tcn.pth"
+        self.tcn = MultiModalStressTCN(seq_len=seq_len).to(self.device)
+        self.feature_buffer = []  # List of 258D numpy arrays
         
-        if self.model is None or frame is None or 'face_bbox' not in keypoints:
-            return 'Neutral', level, heuristic_score
+        if os.path.exists(tcn_path):
+            try:
+                self.tcn.load_state_dict(torch.load(tcn_path, map_location=self.device, weights_only=True))
+            except Exception:
+                pass
+        
+    def predict(self, keypoints, frame=None, temporal_geometries=None):
+        """
+        Extracts deep feature vectors, concatenates with temporal_geometries, and evaluates TCN.
+        Returns (legacy_emotion, mapped_stress_level, stress_score_float)
+        """
+        # Defaults
+        emotion = 'Neutral'
+        level = 'Low'
+        stress_score = 0.0
+        
+        if temporal_geometries is None:
+            # Fallback if accessed via direct standalone call without temporal analytics
+            temporal_geometries = (0.0, 0.0, 0.0, 0.0, 0.0) # (delta_brow_norm, blink_state, rx, ry, rz)
+            
+        deep_vector = np.zeros(256, dtype=np.float32)
 
-        # 2. Extract face crop using MediaPipe bounding box
-        x_min, y_min, x_max, y_max = keypoints['face_bbox']
-        
-        # Add padding (e.g., 20%) to capture full face dynamically
-        w = x_max - x_min
-        h = y_max - y_min
-        pad_x = int(w * 0.2)
-        pad_y = int(h * 0.2)
-        
-        x_min = max(0, x_min - pad_x)
-        y_min = max(0, y_min - pad_y)
-        x_max = min(frame.shape[1], x_max + pad_x)
-        y_max = min(frame.shape[0], y_max + pad_y)
-        
-        face_crop = frame[y_min:y_max, x_min:x_max]
-        if face_crop.size == 0 or face_crop.shape[0] == 0 or face_crop.shape[1] == 0:
-            return 'Neutral', level, heuristic_score
+        if self.feature_extractor is not None and frame is not None and 'face_bbox' in keypoints:
+            x_min, y_min, x_max, y_max = keypoints['face_bbox']
             
-        # 3. Preprocess for CNN
-        if len(face_crop.shape) == 3:
-            face_crop = cv2.cvtColor(face_crop, cv2.COLOR_BGR2GRAY)
+            # Add padding
+            w, h = x_max - x_min, y_max - y_min
+            pad_x, pad_y = int(w * 0.2), int(h * 0.2)
             
-        face_crop = cv2.resize(face_crop, (48, 48))
+            x_min = max(0, x_min - pad_x)
+            y_min = max(0, y_min - pad_y)
+            x_max = min(frame.shape[1], x_max + pad_x)
+            y_max = min(frame.shape[0], y_max + pad_y)
+            
+            face_crop = frame[y_min:y_max, x_min:x_max]
+            
+            if face_crop.size > 0 and face_crop.shape[0] > 0 and face_crop.shape[1] > 0:
+                if len(face_crop.shape) == 3:
+                    face_crop = cv2.cvtColor(face_crop, cv2.COLOR_BGR2GRAY)
+                face_crop = cv2.resize(face_crop, (48, 48))
+                tensor = self.transform(face_crop).unsqueeze(0).to(self.device).float()
+                
+                with torch.no_grad():
+                    # Extract 256D embedding
+                    feat = self.feature_extractor(tensor) # (1, 256)
+                    deep_vector = feat[0].cpu().numpy()
+                    
+                    # Compute legacy emotion text
+                    if self.legacy_model:
+                        out = self.legacy_model(tensor)
+                        probs = torch.nn.functional.softmax(out, dim=1)[0]
+                        emotion = self.idx_to_class[torch.argmax(probs).item()].capitalize()
         
-        # PyTorch requires specific shapes and types mapping
-        tensor = self.transform(face_crop).unsqueeze(0).to(self.device).float()
+        # Multi-modal fusion
+        delta_brow_norm, blink_state, rx, ry, rz = temporal_geometries
+        # Feature Vector: 261D
+        combined_vector = np.concatenate([deep_vector, [delta_brow_norm, blink_state, rx, ry, rz]]).astype(np.float32)
         
-        # 4. Inference
-        with torch.no_grad():
-            outputs = self.model(tensor)
-            probs = torch.nn.functional.softmax(outputs, dim=1)[0]
+        self.feature_buffer.append(combined_vector)
+        if len(self.feature_buffer) > self.seq_len:
+            self.feature_buffer.pop(0)
             
-            pred_idx = torch.argmax(probs).item()
-            emotion = self.idx_to_class[pred_idx]
+        # Run TCN inference
+        if len(self.feature_buffer) > 0:
+            pad_len = self.seq_len - len(self.feature_buffer)
+            seq = np.array([self.feature_buffer[0]] * pad_len + self.feature_buffer)
             
-            # Calculate stress score by summing probabilities of stress-class emotions
-            stress_prob = sum(probs[i].item() for i, emo in self.idx_to_class.items() if emo in self.stress_emotions)
+            seq_tensor = torch.tensor(seq).unsqueeze(0).to(self.device) # (1, Seq_len, 258)
             
-            # Map back to Low/Medium/High for backward compatibility
-            if stress_prob >= 0.7:
+            self.tcn.eval()
+            with torch.no_grad():
+                stress_res = self.tcn(seq_tensor)
+                stress_score = stress_res[0, 0].item()
+                
+            # Map continuous stress to categorical levels
+            if stress_score >= 0.7:
                 level = 'High'
-            elif stress_prob >= 0.4:
+            elif stress_score >= 0.4:
                 level = 'Medium'
             else:
                 level = 'Low'
                 
-            return emotion.capitalize(), level, stress_prob
+        return emotion, level, stress_score
