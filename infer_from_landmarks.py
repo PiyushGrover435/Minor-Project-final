@@ -21,6 +21,7 @@ from landmark_indices import (
     LEFT_UPPER_EYELID, LEFT_LOWER_EYELID,
     RIGHT_UPPER_EYELID, RIGHT_LOWER_EYELID,
     LEFT_EYEBROW, RIGHT_EYEBROW,
+    LEFT_EYE_POINTS, RIGHT_EYE_POINTS,
     NUM_LANDMARKS,
 )
 from analytics import RealtimeAnalyzer
@@ -63,6 +64,8 @@ def row_to_keypoints(row):
         'left_lower_eyelid':   safe(LEFT_LOWER_EYELID),
         'right_upper_eyelid':  safe(RIGHT_UPPER_EYELID),
         'right_lower_eyelid':  safe(RIGHT_LOWER_EYELID),
+        'left_eye_points':     tuple(safe(i) for i in LEFT_EYE_POINTS),
+        'right_eye_points':    tuple(safe(i) for i in RIGHT_EYE_POINTS),
     }
 
 

@@ -9,7 +9,7 @@ import cv2
 import numpy as np
 import time
 
-from landmark_indices import LEFT_IRIS, RIGHT_IRIS, IDX
+from landmark_indices import LEFT_IRIS, RIGHT_IRIS, IDX, LEFT_EYE_POINTS, RIGHT_EYE_POINTS
 
 # Try to support both MediaPipe solutions (classic) and the newer Tasks API.
 try:
@@ -156,7 +156,11 @@ class VisionEngine:
                 int(np.min(lm[:, 1])), # y_min
                 int(np.max(lm[:, 0])), # x_max
                 int(np.max(lm[:, 1]))  # y_max
-            )
+            ),
+            'left_eye_points':     tuple(lm[idx] for idx in LEFT_EYE_POINTS),
+            'right_eye_points':    tuple(lm[idx] for idx in RIGHT_EYE_POINTS),
+            'left_iris_pts':       tuple(lm[idx] for idx in LEFT_IRIS),
+            'right_iris_pts':      tuple(lm[idx] for idx in RIGHT_IRIS)
         }
         
         # ── Head Pose Estimation (6-DOF via solvePnP) ──────────────────

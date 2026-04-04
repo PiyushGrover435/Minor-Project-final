@@ -223,23 +223,24 @@ class RealtimeAnalyzer:
     # ── Helper: eye-opening ratio ───────────────────────────────────
 
     @staticmethod
-    def _eye_opening_ratio(keypoints):
-        """Estimate eye opening normalised by inter-ocular distance."""
-        req = ('left_upper_eyelid', 'left_lower_eyelid',
-               'right_upper_eyelid', 'right_lower_eyelid',
-               'left_inner', 'right_inner')
-        if not all(k in keypoints for k in req):
+    def _eye_aspect_ratio(eye_pts):
+        """Compute the Eye Aspect Ratio for a 6-point eye contour."""
+        p1, p2, p3, p4, p5, p6 = [np.asarray(pt, dtype=np.float32) for pt in eye_pts]
+        dist_vert1 = np.linalg.norm(p2 - p6)
+        dist_vert2 = np.linalg.norm(p3 - p5)
+        dist_horiz = np.linalg.norm(p1 - p4)
+        if dist_horiz < EPS:
+            return 0.0
+        return float((dist_vert1 + dist_vert2) / (2.0 * dist_horiz))
+
+    def _eye_opening_ratio(self, keypoints):
+        """Estimate eye opening using formal Eye Aspect Ratio (EAR)."""
+        if 'left_eye_points' not in keypoints or 'right_eye_points' not in keypoints:
             return None
-
-        left_up   = np.asarray(keypoints['left_upper_eyelid'],  dtype=np.float32)
-        left_low  = np.asarray(keypoints['left_lower_eyelid'],  dtype=np.float32)
-        right_up  = np.asarray(keypoints['right_upper_eyelid'], dtype=np.float32)
-        right_low = np.asarray(keypoints['right_lower_eyelid'], dtype=np.float32)
-
-        interocular = _interocular(keypoints)
-        left_open  = float((left_low[1]  - left_up[1])  / interocular)
-        right_open = float((right_low[1] - right_up[1]) / interocular)
-        return (left_open + right_open) * 0.5
+        
+        left_ear = self._eye_aspect_ratio(keypoints['left_eye_points'])
+        right_ear = self._eye_aspect_ratio(keypoints['right_eye_points'])
+        return (left_ear + right_ear) * 0.5
 
     # ── Main update ─────────────────────────────────────────────────
 
@@ -318,7 +319,7 @@ class RealtimeAnalyzer:
 
                 if self._calib_eye_open_vals:
                     self._baseline_eye_open = float(np.median(self._calib_eye_open_vals))
-                    self.blink_threshold = self._baseline_eye_open * 0.4
+                    self.blink_threshold = self._baseline_eye_open * 0.7
 
                 self._calibrated = True
 

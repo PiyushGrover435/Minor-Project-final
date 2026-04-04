@@ -25,6 +25,11 @@ LEFT_LOWER_EYELID  = 145
 RIGHT_UPPER_EYELID = 386
 RIGHT_LOWER_EYELID = 374
 
+# ── Full Eye Contours (for EAR) ────────────────────────────────────
+# Ordered as: p1 (corner), p2, p3 (uppers), p4 (corner), p5, p6 (lowers)
+LEFT_EYE_POINTS  = (33, 160, 158, 133, 153, 144)
+RIGHT_EYE_POINTS = (362, 385, 387, 263, 373, 380)
+
 # ── Eyebrows (mid-point of brow arch) ─────────────────────────────
 LEFT_EYEBROW  = 105
 RIGHT_EYEBROW = 334

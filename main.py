@@ -86,16 +86,28 @@ def draw_overlay(frame, kp, result, fps):
     put(f'Integrity: {int(integrity)}', col=_integrity_colour(integrity))
     put(f'FPS: {fps:.0f}', col=COL_CYAN, scale=0.5, thickness=1)
 
-    # ── Draw iris centres and eye corners ───────────────────────────
-    draw_keys = ('left_iris', 'right_iris', 'left_outer', 'left_inner',
-                 'right_outer', 'right_inner')
+    # ── Draw Eye & Iris Structural Geometries (Mesh Contours) ───────────
+    draw_keys = ('left_eye_points', 'right_eye_points', 'left_iris_pts', 'right_iris_pts', 'left_iris', 'right_iris')
     if all(k in kp for k in draw_keys):
+        # 1. Draw solid center dot for tracked gaze anchors
         for name in ('left_iris', 'right_iris'):
             pt = tuple(kp[name].astype(int))
-            cv2.circle(frame, pt, 4, COL_IRIS, -1)
-        for name in ('left_outer', 'left_inner', 'right_outer', 'right_inner'):
-            pt = tuple(kp[name].astype(int))
-            cv2.circle(frame, pt, 2, COL_CORNER, -1)
+            cv2.circle(frame, pt, 2, COL_WHITE, -1)
+            
+        # 2. Draw outer eye meshing (Red)
+        for name in ('left_eye_points', 'right_eye_points'):
+            pts = np.array([pt for pt in kp[name]], np.int32).reshape((-1, 1, 2))
+            cv2.polylines(frame, [pts], isClosed=True, color=COL_RED, thickness=1, lineType=cv2.LINE_AA)
+            for pt in kp[name]:
+                cv2.circle(frame, tuple(int(c) for c in pt), 1, COL_RED, -1)
+                
+        # 3. Draw inner Iris meshing (Green)
+        for name in ('left_iris_pts', 'right_iris_pts'):
+            pts = np.array([pt for pt in kp[name]], np.int32).reshape((-1, 1, 2))
+            # MediaPipe's 4 iris points define a distinct circle when fitted or bounded
+            cv2.polylines(frame, [pts], isClosed=True, color=COL_IRIS, thickness=1, lineType=cv2.LINE_AA)
+            for pt in kp[name]:
+                cv2.circle(frame, tuple(int(c) for c in pt), 1, COL_IRIS, -1)
 
 
 def main():

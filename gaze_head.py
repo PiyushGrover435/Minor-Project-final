@@ -7,25 +7,20 @@ import torch.optim as optim
 
 class HybridGazeModel(nn.Module):
     """
-    Spatial-Temporal Hybrid Model for Gaze Estimation with 6-DOF Head Pose correction.
-    CNN processes individual eye patches -> TCN filters temporal jitter -> 
+    Structured Geometry Model for Gaze Estimation with 6-DOF Head Pose correction.
+    MLP processes mesh coordinates (EAR + Iris Vectors) -> TCN filters temporal jitter -> 
     Head Pose (Pitch,Yaw,Roll) concatenated -> maps to screen (x, y).
     """
-    def __init__(self, seq_len=15, feature_dim=64, pose_dim=3):
+    def __init__(self, seq_len=15, input_dim=6, feature_dim=64, pose_dim=3):
         super().__init__()
         self.feature_dim = feature_dim
-        # Spatial Feature Extractor (Tiny CNN) - input: 1x36x60
-        self.cnn = nn.Sequential(
-            nn.Conv2d(1, 16, kernel_size=3, padding=1),
+        
+        # Spatial Feature Extractor (MLP on geometric coordinates)
+        self.feature_extractor = nn.Sequential(
+            nn.Linear(input_dim, 32),
             nn.ReLU(),
-            nn.MaxPool2d(2), # 18x30
-            nn.Conv2d(16, 32, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2), # 9x15
-            nn.Conv2d(32, feature_dim, kernel_size=3, stride=2, padding=1), # 5x8
-            nn.ReLU(),
-            nn.AdaptiveAvgPool2d((1, 1)), # Global average pooling
-            nn.Flatten() # outputs feature_dim
+            nn.Linear(32, feature_dim),
+            nn.ReLU()
         )
         
         # Temporal Convolutional Network (1D Dilated Convolutions)
@@ -49,14 +44,14 @@ class HybridGazeModel(nn.Module):
         """
         Parameters
         ----------
-        eye_sequence : (Batch, SeqLen, 1, 36, 60)
+        eye_sequence : (Batch, SeqLen, input_dim) - Geometric feature vectors
         head_pose    : (Batch, 3) — Pitch, Yaw, Roll in degrees.  If None, zeros.
         """
-        batch_size, seq_len, c, h, w = eye_sequence.shape
+        batch_size, seq_len, dim = eye_sequence.shape
         
-        # Fold sequence into batch dimension for CNN
-        x_cnn = eye_sequence.view(-1, c, h, w)
-        features = self.cnn(x_cnn) # (Batch * SeqLen, feature_dim)
+        # Fold sequence into batch dimension for MLP
+        x_flat = eye_sequence.view(-1, dim)
+        features = self.feature_extractor(x_flat) # (Batch * SeqLen, feature_dim)
         
         # Reshape for TCN: (Batch, feature_dim, SeqLen)
         features = features.view(batch_size, seq_len, -1).transpose(1, 2)
@@ -106,35 +101,30 @@ class GazeHead:
         self.optimizer = optim.SGD(self.model.parameters(), lr=0.01)
         self.criterion = nn.MSELoss()
 
-    def _extract_eye_patch(self, frame, inner, outer, iris):
+    def _extract_geometric_features(self, keypoints):
         """
-        Extracts a 36x60 eye patch from the frame.
-        We use the average of both eyes to form a single patch, or just the left eye for simplicity.
-        To handle both eyes simultaneously, we'll fuse them horizontally: 36x120 -> resize to 36x60.
-        Actually, simpler standard is just tracking the left eye patch, or stacking them. 
-        For this prototype, we'll extract left eye, as sequence processing is computationally heavier.
+        Extract a 1D tensor representing normalized mesh features.
+        6 features: Normalized Left/Right Iris Vectors, Left/Right EAR.
         """
-        w = int(abs(outer[0] - inner[0]) * 1.5)
-        if w == 0: w = 30
-        h = int(w * (36.0 / 60.0))
-        
-        cx, cy = int(iris[0]), int(iris[1])
-        x_min = max(0, cx - w // 2)
-        y_min = max(0, cy - h // 2)
-        x_max = min(frame.shape[1], x_min + w)
-        y_max = min(frame.shape[0], y_min + h)
-        
-        patch = frame[y_min:y_max, x_min:x_max]
-        if patch.size == 0 or patch.shape[0] == 0 or patch.shape[1] == 0:
-            return np.zeros((36, 60), dtype=np.float32)
-            
-        if len(patch.shape) == 3:
-            patch = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
-        patch = cv2.resize(patch, (60, 36))
-        
-        # Normalize patch to [0, 1]
-        patch = patch.astype(np.float32) / 255.0
-        return patch
+        left_inner = np.asarray(keypoints['left_inner'])
+        right_inner = np.asarray(keypoints['right_inner'])
+        interocular = np.linalg.norm(left_inner - right_inner)
+        if interocular < 1e-5:
+            interocular = 1.0
+
+        def norm_vec(p1, p0):
+            v = np.asarray(p1) - np.asarray(p0)
+            return float(v[0]) / interocular, float(v[1]) / interocular
+
+        lx, ly = norm_vec(keypoints['left_iris'], keypoints['left_inner'])
+        rx, ry = norm_vec(keypoints['right_iris'], keypoints['right_inner'])
+
+        from analytics import RealtimeAnalyzer
+        left_ear = RealtimeAnalyzer._eye_aspect_ratio(keypoints['left_eye_points'])
+        right_ear = RealtimeAnalyzer._eye_aspect_ratio(keypoints['right_eye_points'])
+
+        vec = np.array([lx, ly, rx, ry, left_ear, right_ear], dtype=np.float32)
+        return vec
 
     def update_buffer(self, patch):
         self.patch_buffer.append(patch)
@@ -142,9 +132,10 @@ class GazeHead:
             self.patch_buffer.pop(0)
 
     def _get_sequence_tensor(self):
-        """Returns sequence tensor of shape (1, seq_len, 1, 36, 60). Pads if buffer is small."""
+        """Returns sequence tensor of shape (1, seq_len, input_dim)."""
+        input_dim = 6
         if len(self.patch_buffer) == 0:
-            seq = np.zeros((self.seq_len, 36, 60), dtype=np.float32)
+            seq = np.zeros((self.seq_len, input_dim), dtype=np.float32)
         elif len(self.patch_buffer) < self.seq_len:
             pad_len = self.seq_len - len(self.patch_buffer)
             pad = [self.patch_buffer[0]] * pad_len
@@ -152,8 +143,8 @@ class GazeHead:
         else:
             seq = np.array(self.patch_buffer)
         
-        # Map to PyTorch format
-        seq = torch.tensor(seq).unsqueeze(0).unsqueeze(2).to(self.device) # (1, Seq_len, 1, 36, 60)
+        # Map to PyTorch format (1, Seq_len, input_dim)
+        seq = torch.tensor(seq).unsqueeze(0).to(self.device)
         return seq
 
     def predict(self, keypoints, frame=None):
@@ -177,14 +168,14 @@ class GazeHead:
             self.patch_buffer.clear()
             return 'Off-screen', gaze_vals
 
-        if frame is None:
-            # Fallback
+        if 'left_eye_points' not in keypoints or 'right_eye_points' not in keypoints:
+            # Fallback if the full contour points aren't available yet
             avg = (left_t + right_t) * 0.5
             return 'Center' if 0.35 <= avg <= 0.65 else 'Left' if avg < 0.35 else 'Right', gaze_vals
 
-        # Extract patch and update temporal dimension
-        patch = self._extract_eye_patch(frame, keypoints['left_inner'], keypoints['left_outer'], keypoints['left_iris'])
-        self.update_buffer(patch)
+        # Extract structured geometric vector and update temporal dimension
+        feature_vec = self._extract_geometric_features(keypoints)
+        self.update_buffer(feature_vec)
 
         # Extract head pose for pose-corrected prediction
         hp = keypoints.get('head_pose', (0.0, 0.0, 0.0))
@@ -218,12 +209,12 @@ class GazeHead:
         Runs a single backward pass mapping the current eye sequence to the known screen point.
         Head Pose is included so the model learns to compensate for head movement.
         """
-        req = ('left_iris', 'left_inner', 'left_outer')
-        if not all(k in keypoints for k in req) or frame is None:
+        req = ('left_iris', 'left_inner', 'left_eye_points', 'right_eye_points')
+        if not all(k in keypoints for k in req):
             return 0.0
 
-        patch = self._extract_eye_patch(frame, keypoints['left_inner'], keypoints['left_outer'], keypoints['left_iris'])
-        self.update_buffer(patch)
+        feature_vec = self._extract_geometric_features(keypoints)
+        self.update_buffer(feature_vec)
         
         hp = keypoints.get('head_pose', (0.0, 0.0, 0.0))
         pose_tensor = torch.tensor([[hp[0], hp[1], hp[2]]], dtype=torch.float32).to(self.device)
