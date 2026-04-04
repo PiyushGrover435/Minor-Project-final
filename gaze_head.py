@@ -7,11 +7,13 @@ import torch.optim as optim
 
 class HybridGazeModel(nn.Module):
     """
-    Spatial-Temporal Hybrid Model for Gaze Estimation.
-    CNN processes individual eye patches -> TCN filters temporal jitter over sequences -> maps to screen (x, y).
+    Spatial-Temporal Hybrid Model for Gaze Estimation with 6-DOF Head Pose correction.
+    CNN processes individual eye patches -> TCN filters temporal jitter -> 
+    Head Pose (Pitch,Yaw,Roll) concatenated -> maps to screen (x, y).
     """
-    def __init__(self, seq_len=15, feature_dim=64):
+    def __init__(self, seq_len=15, feature_dim=64, pose_dim=3):
         super().__init__()
+        self.feature_dim = feature_dim
         # Spatial Feature Extractor (Tiny CNN) - input: 1x36x60
         self.cnn = nn.Sequential(
             nn.Conv2d(1, 16, kernel_size=3, padding=1),
@@ -35,16 +37,21 @@ class HybridGazeModel(nn.Module):
             nn.ReLU(),
         )
         
-        # Dense Regressor to continuous (x, y) screen coordinates
+        # Dense Regressor: TCN features (64D) + Head Pose (3D) -> screen (x, y)
         self.regressor = nn.Sequential(
-            nn.Linear(feature_dim, 32),
+            nn.Linear(feature_dim + pose_dim, 32),
             nn.ReLU(),
             nn.Linear(32, 2), # (x, y)
             nn.Sigmoid()      # output normalized to [0, 1] screen bounds
         )
 
-    def forward(self, eye_sequence):
-        # eye_sequence shape: (Batch, SeqLen, 1, 36, 60)
+    def forward(self, eye_sequence, head_pose=None):
+        """
+        Parameters
+        ----------
+        eye_sequence : (Batch, SeqLen, 1, 36, 60)
+        head_pose    : (Batch, 3) — Pitch, Yaw, Roll in degrees.  If None, zeros.
+        """
         batch_size, seq_len, c, h, w = eye_sequence.shape
         
         # Fold sequence into batch dimension for CNN
@@ -60,8 +67,13 @@ class HybridGazeModel(nn.Module):
         # Take the feature of the most recent timestep (last element in sequence)
         last_timestep_feature = tcn_out[:, :, -1] # (Batch, feature_dim)
         
+        # Fuse with head pose
+        if head_pose is None:
+            head_pose = torch.zeros(batch_size, 3, device=last_timestep_feature.device)
+        fused = torch.cat([last_timestep_feature, head_pose], dim=1) # (Batch, feature_dim + 3)
+        
         # Regress to (x, y)
-        out = self.regressor(last_timestep_feature)
+        out = self.regressor(fused)
         return out
 
 
@@ -174,11 +186,15 @@ class GazeHead:
         patch = self._extract_eye_patch(frame, keypoints['left_inner'], keypoints['left_outer'], keypoints['left_iris'])
         self.update_buffer(patch)
 
+        # Extract head pose for pose-corrected prediction
+        hp = keypoints.get('head_pose', (0.0, 0.0, 0.0))
+        pose_tensor = torch.tensor([[hp[0], hp[1], hp[2]]], dtype=torch.float32).to(self.device)
+
         # Predict screen coordinates
         self.model.eval()
         with torch.no_grad():
             seq_tensor = self._get_sequence_tensor()
-            pred = self.model(seq_tensor) # (1, 2)
+            pred = self.model(seq_tensor, head_pose=pose_tensor) # (1, 2)
             x_norm, y_norm = pred[0].cpu().numpy()
             
             # Map normalized x screen coordinate back to generic categorical zones 
@@ -200,6 +216,7 @@ class GazeHead:
         """
         Local personalization via Stochastic Gradient Descent.
         Runs a single backward pass mapping the current eye sequence to the known screen point.
+        Head Pose is included so the model learns to compensate for head movement.
         """
         req = ('left_iris', 'left_inner', 'left_outer')
         if not all(k in keypoints for k in req) or frame is None:
@@ -208,13 +225,16 @@ class GazeHead:
         patch = self._extract_eye_patch(frame, keypoints['left_inner'], keypoints['left_outer'], keypoints['left_iris'])
         self.update_buffer(patch)
         
+        hp = keypoints.get('head_pose', (0.0, 0.0, 0.0))
+        pose_tensor = torch.tensor([[hp[0], hp[1], hp[2]]], dtype=torch.float32).to(self.device)
+        
         self.model.train()
         self.optimizer.zero_grad()
         
         seq_tensor = self._get_sequence_tensor()
         target_tensor = torch.tensor([[target_x_norm, target_y_norm]], dtype=torch.float32).to(self.device)
         
-        pred = self.model(seq_tensor)
+        pred = self.model(seq_tensor, head_pose=pose_tensor)
         loss = self.criterion(pred, target_tensor)
         
         loss.backward()

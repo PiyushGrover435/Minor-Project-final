@@ -244,7 +244,8 @@ class RealtimeAnalyzer:
     # ── Main update ─────────────────────────────────────────────────
 
     def _make_result(self, gaze_label, gaze_vals, stress_level, stress_score,
-                     integrity, calibrating=False, calib_remaining=0, emotion='Neutral'):
+                     integrity, calibrating=False, calib_remaining=0, emotion='Neutral',
+                     head_pose=(0.0, 0.0, 0.0)):
         """Uniform result dict for all return paths."""
         return {
             'gaze_label':      gaze_label,
@@ -255,6 +256,7 @@ class RealtimeAnalyzer:
             'integrity':       integrity,
             'calibrating':     calibrating,
             'calib_remaining': calib_remaining,
+            'head_pose':       head_pose,
         }
 
     def update(self, keypoints, frame=None):
@@ -264,8 +266,10 @@ class RealtimeAnalyzer:
         Returns
         -------
         dict with keys: gaze_label, gaze_vals, stress_level, stress_score, emotion,
-                        integrity, calibrating, calib_remaining
+                        integrity, calibrating, calib_remaining, head_pose
         """
+        hp = keypoints.get('head_pose', (0.0, 0.0, 0.0))
+        
         # ML Gaze Head prediction
         gaze_label, gaze_vals = self.gaze_head.predict(keypoints, frame)
         
@@ -274,7 +278,7 @@ class RealtimeAnalyzer:
             # Fallback if no face
             emotion, ml_level, ml_score = self.affective_head.predict(keypoints, frame)
             return self._make_result(gaze_label, gaze_vals, 'Low', 0.0,
-                                     self.prev_integrity, emotion=emotion)
+                                     self.prev_integrity, emotion=emotion, head_pose=hp)
 
         eye_open = self._eye_opening_ratio(keypoints)
         
@@ -320,7 +324,8 @@ class RealtimeAnalyzer:
 
             return self._make_result('Calibrating', gaze_vals, 'Low', 0.0,
                                      self.prev_integrity,
-                                     calibrating=True, calib_remaining=remaining, emotion=emotion)
+                                     calibrating=True, calib_remaining=remaining, emotion=emotion,
+                                     head_pose=hp)
 
         # ── Compute stress delta from calibrated baseline ───────────
         delta = self._baseline_dist - raw
@@ -345,7 +350,7 @@ class RealtimeAnalyzer:
             smooth = float(np.mean(self.stress_buf)) if self.stress_buf else ml_score
             integrity = compute_integrity(self.prev_integrity, gaze_label, 'Low', smooth)
             self.prev_integrity = integrity
-            return self._make_result(gaze_label, gaze_vals, 'Low', smooth, integrity, emotion=emotion)
+            return self._make_result(gaze_label, gaze_vals, 'Low', smooth, integrity, emotion=emotion, head_pose=hp)
 
         # Override if ML model provides higher confidence structure
         if hasattr(self.affective_head, 'tcn') and self.affective_head.tcn is not None:
@@ -363,4 +368,4 @@ class RealtimeAnalyzer:
         integrity = compute_integrity(self.prev_integrity, gaze_label, level, smooth)
         self.prev_integrity = integrity
 
-        return self._make_result(gaze_label, gaze_vals, level, smooth, integrity, emotion=emotion)
+        return self._make_result(gaze_label, gaze_vals, level, smooth, integrity, emotion=emotion, head_pose=hp)

@@ -159,26 +159,57 @@ class VisionEngine:
             )
         }
         
-        # Compute Head Pose (Rx, Ry, Rz) proxy using normalized 3D landmarks
+        # ── Head Pose Estimation (6-DOF via solvePnP) ──────────────────
+        #
+        # Canonical 3D face model points (generic human face proportions).
+        # These correspond to MediaPipe landmark indices:
+        #   1  = Nose tip
+        #   152 = Chin
+        #   33  = Left eye outer corner
+        #   263 = Right eye outer corner
+        #   61  = Left mouth corner
+        #   291 = Right mouth corner
+        _MODEL_3D = np.array([
+            (0.0,    0.0,    0.0),      # Nose tip
+            (0.0,   -63.6,  -12.5),     # Chin
+            (-43.3,  32.7,  -26.0),     # Left eye outer
+            (43.3,   32.7,  -26.0),     # Right eye outer
+            (-28.9, -28.9,  -24.1),     # Left mouth
+            (28.9,  -28.9,  -24.1),     # Right mouth
+        ], dtype=np.float64)
+        _POSE_IDX = [1, 152, 33, 263, 61, 291]
+
         try:
-            # 1 (Nose), 33 (Left Eye Outer), 263 (Right Eye Outer)
-            # Find the actual elements from the sequence whether they are protobufs or Tasks API objects
-            nose = lm_seq[1]
-            le = lm_seq[33]
-            re = lm_seq[263]
-            
-            rx = float((le.y + re.y) / 2.0 - nose.y)  # Pitch proxy
-            ry = float((le.x + re.x) / 2.0 - nose.x)  # Yaw proxy
-            rz = float(le.y - re.y)                   # Roll proxy
-            
-            # Incorporate Z if available (MediaPipe FaceLandmarker provides Z)
-            if hasattr(nose, 'z'):
-                # 3D Yaw relative to depth
-                ry = float(nose.z - (le.z + re.z)/2.0)
-                
-            keypoints['head_pose'] = (rx, ry, rz)
+            image_pts = np.array([lm[i] for i in _POSE_IDX], dtype=np.float64)  # Nx2 pixel
+
+            # Approximate camera intrinsics from frame dimensions
+            focal = float(w)
+            cx_cam, cy_cam = w / 2.0, h / 2.0
+            cam_matrix = np.array([
+                [focal, 0,     cx_cam],
+                [0,     focal, cy_cam],
+                [0,     0,     1.0   ],
+            ], dtype=np.float64)
+            dist_coeffs = np.zeros((4, 1), dtype=np.float64)
+
+            success, rvec, tvec = cv2.solvePnP(
+                _MODEL_3D, image_pts, cam_matrix, dist_coeffs,
+                flags=cv2.SOLVEPNP_ITERATIVE,
+            )
+            if success:
+                # rvec is Rodrigues (3x1).  Convert to degrees for readability.
+                pitch = float(np.degrees(rvec[0, 0]))  # Rx — nodding
+                yaw   = float(np.degrees(rvec[1, 0]))  # Ry — shaking head
+                roll  = float(np.degrees(rvec[2, 0]))  # Rz — tilting head
+                tx, ty, tz = float(tvec[0, 0]), float(tvec[1, 0]), float(tvec[2, 0])
+                keypoints['head_pose'] = (pitch, yaw, roll)
+                keypoints['head_translation'] = (tx, ty, tz)
+            else:
+                keypoints['head_pose'] = (0.0, 0.0, 0.0)
+                keypoints['head_translation'] = (0.0, 0.0, 0.0)
         except Exception:
             keypoints['head_pose'] = (0.0, 0.0, 0.0)
+            keypoints['head_translation'] = (0.0, 0.0, 0.0)
 
         # Add all named indices from the canonical map
         for name, idx in IDX.items():

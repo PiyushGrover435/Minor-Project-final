@@ -12,6 +12,7 @@ import numpy as np
 from vision_engine import VisionEngine
 from analytics import compute_integrity, RealtimeAnalyzer
 from calibration import CalibrationEngine
+from landmark_smoother import KeypointSmoother
 
 
 # ── Overlay colours ─────────────────────────────────────────────────
@@ -75,6 +76,10 @@ def draw_overlay(frame, kp, result, fps):
     put(f'Gaze: {gaze_label}')
     put(f"Gaze L:{gaze_vals['left_t']:.2f}  R:{gaze_vals['right_t']:.2f}")
     
+    # Head Pose display (6-DOF solvePnP)
+    hp = result.get('head_pose', (0.0, 0.0, 0.0))
+    put(f'Pose P:{hp[0]:+.1f} Y:{hp[1]:+.1f} R:{hp[2]:+.1f}', col=COL_CYAN, scale=0.5, thickness=1)
+    
     emotion = result.get('emotion', 'Neutral')
     put(f'Emotion: {emotion}')
     put(f'Stress: {stress_level} ({stress_score:.2f})')
@@ -103,6 +108,7 @@ def main():
     analyzer = RealtimeAnalyzer(window=12, calib_frames=30)
     integrity = analyzer.prev_integrity
     calibrator = CalibrationEngine()
+    smoother  = KeypointSmoother()
 
     # FPS tracking
     prev_time = time.time()
@@ -131,6 +137,12 @@ def main():
                 fps = fps * (1.0 - fps_alpha) + instant_fps * fps_alpha
 
             kp = engine.process(frame)
+
+            # ── Kalman temporal smoothing ───────────────────────────
+            if kp is None:
+                smoother.reset()
+            else:
+                kp = smoother.smooth(kp)
             
             # Create a display frame to manipulate (calibration UI overlays on this)
             display_frame = frame.copy()
