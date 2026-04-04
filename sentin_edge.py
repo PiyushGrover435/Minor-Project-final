@@ -1,3 +1,8 @@
+"""
+sentin_edge.py
+
+Minimal prototype runner — demonstrates VisionEngine iris tracking with OpenCV overlay.
+"""
 import cv2
 from vision_engine import VisionEngine
 
@@ -6,7 +11,7 @@ def run():
     engine = VisionEngine()
     cap = cv2.VideoCapture(0)
 
-    print("Starting Sentin-Edge AI Prototype (VisionEngine)...")
+    print('Starting Sentin-Edge AI Prototype (VisionEngine)...')
     print("Press 'q' to exit.")
 
     try:
@@ -15,15 +20,12 @@ def run():
             if not ret:
                 break
 
-            kp = None
             try:
                 kp = engine.process(frame)
             except Exception as e:
-                # If engine isn't available, print a helpful message and exit
                 print('VisionEngine error:', e)
                 break
 
-            # Simple visualization of iris if available
             if kp is not None:
                 try:
                     li = tuple(kp['left_iris'].astype(int))
@@ -31,8 +33,10 @@ def run():
                 except Exception:
                     pass
 
-            cv2.putText(frame, "Sentin-Edge AI: ACTIVE", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            cv2.putText(frame, "Privacy: On-Device (In-Memory)", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            cv2.putText(frame, 'Sentin-Edge AI: ACTIVE', (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            cv2.putText(frame, 'Privacy: On-Device (In-Memory)', (10, 60),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
             cv2.imshow('Phase 1 Prototype - Sentin-Edge', frame)
 
@@ -41,10 +45,7 @@ def run():
 
     finally:
         cap.release()
-        try:
-            engine.close()
-        except Exception:
-            pass
+        engine.close()
         cv2.destroyAllWindows()
 
 

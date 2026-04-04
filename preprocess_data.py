@@ -56,12 +56,19 @@ except Exception:
     MP_TASKS = None
 
 
-# Indices for iris and common eye corners used by MediaPipe refined mesh
+# Import canonical landmark indices
+from landmark_indices import (
+    LEFT_IRIS, RIGHT_IRIS,
+    LEFT_INNER, LEFT_OUTER, RIGHT_INNER, RIGHT_OUTER,
+)
+
+# Full iris range (all 10 iris landmarks) for MPIIGaze JSONL export
 _IRIS_RANGE = list(range(468, 478))  # 468..477
-_LEFT_INNER = 133
-_LEFT_OUTER = 33
-_RIGHT_INNER = 362
-_RIGHT_OUTER = 263
+# Alias canonical names to module-local underscore names for backward compat
+_LEFT_INNER  = LEFT_INNER
+_LEFT_OUTER  = LEFT_OUTER
+_RIGHT_INNER = RIGHT_INNER
+_RIGHT_OUTER = RIGHT_OUTER
 
 
 def read_labels_csv(path: str) -> Dict[str, str]:
@@ -183,54 +190,6 @@ def process_image_tasks(image_path: str, face_landmarker, convert_to_rgb=True) -
     return coords
 
 
-def process_image_haar(image_path: str) -> Optional[List[Tuple[float, float, float]]]:
-    """Approximate 478 landmarks by detecting face bbox with Haar cascade and filling a grid inside it."""
-    img = cv2.imread(image_path)
-    if img is None:
-        return None
-    h, w = img.shape[:2]
-    casc_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-    if not os.path.exists(casc_path):
-        return None
-    face_cascade = cv2.CascadeClassifier(casc_path)
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5)
-    if len(faces) == 0:
-        return None
-    x, y, fw, fh = faces[0]
-
-    # Create grid of points within bbox
-    import math
-
-    n_points = 478
-    side = math.ceil(math.sqrt(n_points))
-    xs = [x + (i + 0.5) * fw / side for i in range(side)]
-    ys = [y + (j + 0.5) * fh / side for j in range(side)]
-    pts = []
-    for yy in ys:
-        for xx in xs:
-            nx = float(xx / w)
-            ny = float(yy / h)
-            pts.append((nx, ny, 0.0))
-            if len(pts) >= n_points:
-                break
-        if len(pts) >= n_points:
-            break
-    # pad if needed
-    if len(pts) < n_points:
-        while len(pts) < n_points:
-            pts.append((0.0, 0.0, 0.0))
-    return pts
-
-
-def write_csv_header_and_rows(csv_path: str, rows: List[List]):
-    """Write rows (list of lists) to CSV (overwrite)."""
-    with open(csv_path, "w", newline="", encoding="utf-8") as fh:
-        writer = csv.writer(fh)
-        for r in rows:
-            writer.writerow(r)
-
-
 def process_dataset(
     dataset: str,
     input_dir: str,
@@ -246,9 +205,6 @@ def process_dataset(
     labels_map = {}
     if labels_csv:
         labels_map = read_labels_csv(labels_csv)
-
-    rows_out = []
-    extra_mpiigaze = []
 
     img_files = []
     for root, _, files in os.walk(input_dir):
@@ -267,11 +223,10 @@ def process_dataset(
         face_mesh = face_mesh_ctx
     elif MP_TASKS is not None:
         engine_mode = "tasks"
-        # If no task_model provided, fall back to Haar (Tasks available but no model supplied)
         if not task_model:
-            print("Note: mediapipe Tasks available but no --task_model provided. Falling back to Haar-cascade approximate landmarks.")
-            face_landmarker = None
-            engine_mode = "haar_fallback"
+            raise RuntimeError(
+                "MediaPipe 'solutions.face_mesh' not available. To use the Tasks API, pass --task_model PATH to a 'face_landmarker.task' model file."
+            )
         else:
             # Create FaceLandmarker via Tasks API with robust import handling
             def _create_face_landmarker(model_path: str):
@@ -282,6 +237,13 @@ def process_dataset(
                 RunningMode = getattr(MP_TASKS, "RunningMode", None)
 
                 # Try to import BaseOptions from core.base_options if not present
+                if BaseOpts is None:
+                    try:
+                        import mediapipe as mp
+                        BaseOpts = mp.tasks.BaseOptions
+                    except Exception:
+                        pass
+                    
                 if BaseOpts is None:
                     try:
                         base_mod = importlib.import_module("mediapipe.tasks.python.core.base_options")
@@ -351,76 +313,70 @@ def process_dataset(
             try:
                 face_landmarker = _create_face_landmarker(task_model)
             except Exception as e:
-                print("Warning: failed to construct FaceLandmarker from Tasks API:", e)
-                print("Falling back to Haar-cascade approximate landmark generation.")
-                face_landmarker = None
-                engine_mode = "haar_fallback"
+                raise RuntimeError("Failed to construct FaceLandmarker from Tasks API: " + str(e))
     else:
         raise RuntimeError(
             "No usable MediaPipe FaceMesh API found. Install a compatible 'mediapipe' or provide a Tasks model via --task_model."
         )
 
-    # If Tasks creation failed earlier, allow a Haar fallback to keep the pipeline runnable.
-    if engine_mode == "tasks" and face_landmarker is None:
-        print("Warning: could not create MediaPipe Tasks FaceLandmarker; falling back to Haar-cascade approximate landmarks.")
-        engine_mode = "haar_fallback"
-
-    for img_path in tqdm(img_files, desc="Processing images"):
-        fname = os.path.basename(img_path)
-        label = None
-        if labels_map and fname in labels_map:
-            label = labels_map[fname]
-        elif dataset.lower() == "fer2013" and map_fer_labels:
-            parent = os.path.basename(os.path.dirname(img_path))
-            label = map_fer_label_to_binary(parent)
-        elif dataset.lower() == "mpiigaze":
-            label = labels_map.get(fname, fname)
-        else:
-            parent = os.path.basename(os.path.dirname(img_path))
-            label = labels_map.get(fname, parent if parent else "unknown")
-
-        if engine_mode == "solutions":
-            coords = process_image(img_path, face_mesh)
-        elif engine_mode == "tasks":
-            coords = process_image_tasks(img_path, face_landmarker)
-        elif engine_mode == "haar_fallback":
-            coords = process_image_haar(img_path)
-        else:
-            coords = None
-
-        if coords is None:
-            row = [label] + [""] * (478 * 3)
-            rows_out.append(row)
-            continue
-
-        if len(coords) < 478:
-            coords = coords + [(0.0, 0.0, 0.0)] * (478 - len(coords))
-        elif len(coords) > 478:
-            coords = coords[:478]
-
-        flat = [label]
-        for (x, y, z) in coords:
-            flat.extend([x, y, z])
-        rows_out.append(flat)
-
-        if dataset.lower() == "mpiigaze" and extra_mpiigaze_json:
-            iris_pts = [(float(coords[i][0]), float(coords[i][1]), float(coords[i][2])) for i in _IRIS_RANGE]
-            eye_corners = {
-                "left_inner": tuple(coords[_LEFT_INNER]),
-                "left_outer": tuple(coords[_LEFT_OUTER]),
-                "right_inner": tuple(coords[_RIGHT_INNER]),
-                "right_outer": tuple(coords[_RIGHT_OUTER]),
-            }
-            extra_mpiigaze.append(
-                {"file": fname, "iris": iris_pts, "eye_corners": eye_corners}
-            )
-
-    write_csv_header_and_rows(output_file, rows_out)
-
+    rows_written = 0
+    json_fh = None
     if dataset.lower() == "mpiigaze" and extra_mpiigaze_json:
-        with open(extra_mpiigaze_json, "w", encoding="utf-8") as fh:
-            for obj in extra_mpiigaze:
-                fh.write(json.dumps(obj) + "\n")
+        json_fh = open(extra_mpiigaze_json, "w", encoding="utf-8")
+
+    try:
+        with open(output_file, "w", newline="", encoding="utf-8") as csv_fh:
+            csv_writer = csv.writer(csv_fh)
+
+            for img_path in tqdm(img_files, desc="Processing images"):
+                fname = os.path.basename(img_path)
+                label = None
+                if labels_map and fname in labels_map:
+                    label = labels_map[fname]
+                elif dataset.lower() == "fer2013" and map_fer_labels:
+                    parent = os.path.basename(os.path.dirname(img_path))
+                    label = map_fer_label_to_binary(parent)
+                elif dataset.lower() == "mpiigaze":
+                    label = labels_map.get(fname, fname)
+                else:
+                    parent = os.path.basename(os.path.dirname(img_path))
+                    label = labels_map.get(fname, parent if parent else "unknown")
+
+                if engine_mode == "solutions":
+                    coords = process_image(img_path, face_mesh)
+                elif engine_mode == "tasks":
+                    coords = process_image_tasks(img_path, face_landmarker)
+                else:
+                    coords = None
+
+                if coords is None:
+                    continue
+
+                if len(coords) < 478:
+                    coords = coords + [(0.0, 0.0, 0.0)] * (478 - len(coords))
+                elif len(coords) > 478:
+                    coords = coords[:478]
+
+                flat = [label]
+                for (x, y, z) in coords:
+                    flat.extend([x, y, z])
+                
+                csv_writer.writerow(flat)
+                rows_written += 1
+
+                if dataset.lower() == "mpiigaze" and json_fh:
+                    iris_pts = [(float(coords[i][0]), float(coords[i][1]), float(coords[i][2])) for i in _IRIS_RANGE]
+                    eye_corners = {
+                        "left_inner": tuple(coords[_LEFT_INNER]),
+                        "left_outer": tuple(coords[_LEFT_OUTER]),
+                        "right_inner": tuple(coords[_RIGHT_INNER]),
+                        "right_outer": tuple(coords[_RIGHT_OUTER]),
+                    }
+                    obj = {"file": fname, "iris": iris_pts, "eye_corners": eye_corners}
+                    json_fh.write(json.dumps(obj) + "\n")
+    finally:
+        if json_fh:
+            json_fh.close()
 
     # Close Tasks API object if created
     if face_landmarker is not None:
@@ -436,7 +392,7 @@ def process_dataset(
         except Exception:
             pass
 
-    print(f"Done. Wrote {len(rows_out)} rows to {output_file}")
+    print(f"Done. Wrote {rows_written} rows to {output_file}")
 
 
 def main():
