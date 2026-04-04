@@ -1,7 +1,7 @@
 """
 main.py
 
-OpenCV visualization loop that runs the VisionEngine and analytics in real-time.
+OpenCV visualisation loop that runs the VisionEngine and analytics in real-time.
 Privacy-first: no frames are saved to disk; all processing is in-memory.
 
 Press 'q' to quit.
@@ -10,37 +10,86 @@ import time
 import cv2
 import numpy as np
 from vision_engine import VisionEngine
-from analytics import compute_gaze, compute_integrity, RealtimeAnalyzer
+from analytics import compute_integrity, RealtimeAnalyzer
 
 
-def draw_overlay(frame, kp, gaze_label, gaze_vals, stress_level, stress_score, integrity_score):
-    h, w = frame.shape[:2]
+# ── Overlay colours ─────────────────────────────────────────────────
+COL_WHITE  = (255, 255, 255)
+COL_GREEN  = (0, 200, 0)
+COL_YELLOW = (0, 180, 200)
+COL_RED    = (0, 60, 200)
+COL_CYAN   = (200, 200, 0)
+COL_IRIS   = (0, 255, 0)
+COL_CORNER = (255, 0, 0)
 
-    # Text overlay
+
+def _integrity_colour(score):
+    """Return a BGR colour reflecting integrity health."""
+    if score > 70:
+        return COL_GREEN
+    if score > 40:
+        return COL_YELLOW
+    return COL_RED
+
+
+def draw_overlay(frame, kp, result, fps):
+    """Render analytics HUD onto the frame."""
     y = 30
-    def put(s, col=(255, 255, 255)):
+
+    def put(text, col=COL_WHITE, scale=0.7, thickness=2):
         nonlocal y
-        cv2.putText(frame, s, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, col, 2, cv2.LINE_AA)
+        cv2.putText(frame, text, (10, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, scale, col, thickness, cv2.LINE_AA)
         y += 26
 
-    put(f'Gaze: {gaze_label}')
-    put(f"Gaze L:{gaze_vals['left_t']:.2f} R:{gaze_vals['right_t']:.2f}")
-    put(f'Stress: {stress_level} ({stress_score:.2f})')
-    # Integrity with color indicating health
-    color = (0, 200, 0) if integrity_score > 70 else (0, 180, 200) if integrity_score > 40 else (0, 60, 200)
-    put(f'Integrity: {int(integrity_score)}', col=color)
+    gaze_label   = result['gaze_label']
+    gaze_vals    = result['gaze_vals']
+    stress_level = result['stress_level']
+    stress_score = result['stress_score']
+    integrity    = result['integrity']
 
-    # Draw iris centers and eye corners
-    try:
-        li = tuple(kp['left_iris'].astype(int))
-        ri = tuple(kp['right_iris'].astype(int))
-        cv2.circle(frame, li, 4, (0, 255, 0), -1)
-        cv2.circle(frame, ri, 4, (0, 255, 0), -1)
+    # ── Calibration progress bar ────────────────────────────────────
+    if result.get('calibrating'):
+        remaining = result.get('calib_remaining', 0)
+        total     = 30  # default calib_frames
+        progress  = max(0.0, 1.0 - remaining / max(total, 1))
+        bar_w     = 200
+        bar_h     = 16
+        x0, y0    = 10, y
+        # Background
+        cv2.rectangle(frame, (x0, y0), (x0 + bar_w, y0 + bar_h), (60, 60, 60), -1)
+        # Fill
+        fill_w = int(bar_w * progress)
+        cv2.rectangle(frame, (x0, y0), (x0 + fill_w, y0 + bar_h), COL_CYAN, -1)
+        # Border
+        cv2.rectangle(frame, (x0, y0), (x0 + bar_w, y0 + bar_h), COL_WHITE, 1)
+        # Label
+        cv2.putText(frame, f'Calibrating... {remaining} frames left',
+                    (x0 + bar_w + 10, y0 + 13),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, COL_CYAN, 1, cv2.LINE_AA)
+        y += bar_h + 12
+        return  # skip normal HUD during calibration
+
+    # ── Normal HUD ──────────────────────────────────────────────────
+    put(f'Gaze: {gaze_label}')
+    put(f"Gaze L:{gaze_vals['left_t']:.2f}  R:{gaze_vals['right_t']:.2f}")
+    
+    emotion = result.get('emotion', 'Neutral')
+    put(f'Emotion: {emotion}')
+    put(f'Stress: {stress_level} ({stress_score:.2f})')
+    put(f'Integrity: {int(integrity)}', col=_integrity_colour(integrity))
+    put(f'FPS: {fps:.0f}', col=COL_CYAN, scale=0.5, thickness=1)
+
+    # ── Draw iris centres and eye corners ───────────────────────────
+    draw_keys = ('left_iris', 'right_iris', 'left_outer', 'left_inner',
+                 'right_outer', 'right_inner')
+    if all(k in kp for k in draw_keys):
+        for name in ('left_iris', 'right_iris'):
+            pt = tuple(kp[name].astype(int))
+            cv2.circle(frame, pt, 4, COL_IRIS, -1)
         for name in ('left_outer', 'left_inner', 'right_outer', 'right_inner'):
-            p = tuple(kp[name].astype(int))
-            cv2.circle(frame, p, 2, (255, 0, 0), -1)
-    except Exception:
-        pass
+            pt = tuple(kp[name].astype(int))
+            cv2.circle(frame, pt, 2, COL_CORNER, -1)
 
 
 def main():
@@ -49,41 +98,64 @@ def main():
         print('Unable to open camera')
         return
 
-    engine = VisionEngine()
+    engine   = VisionEngine()
     analyzer = RealtimeAnalyzer(window=12, calib_frames=30)
     integrity = analyzer.prev_integrity
-    last_time = time.time()
+
+    # FPS tracking
+    prev_time = time.time()
+    fps       = 0.0
+    fps_alpha = 0.1  # EMA smoothing for FPS display
 
     try:
+        # Check the first frame outside the loop or carefully inside to print the error
+        first_frame = True
         while True:
             ret, frame = cap.read()
             if not ret:
+                if first_frame:
+                    print('\n[ERROR] Camera opened (VideoCapture(0) succeeded), but failed to read any frames.')
+                    print('        This is a common Windows issue when another app (like Zoom/Teams) is using the camera,')
+                    print('        or Windows Privacy settings are blocking Python from accessing the camera.')
                 break
+            first_frame = False
+
+            # ── FPS calculation ─────────────────────────────────────
+            now     = time.time()
+            dt      = now - prev_time
+            prev_time = now
+            if dt > 0:
+                instant_fps = 1.0 / dt
+                fps = fps * (1.0 - fps_alpha) + instant_fps * fps_alpha
 
             kp = engine.process(frame)
+
             if kp is None:
-                # No face: decay integrity slowly and show off-screen
+                # No face detected — decay integrity
                 integrity = compute_integrity(integrity, 'Off-screen', 'Medium', 0.3)
-                draw_overlay(frame, {}, 'Off-screen', {'left_t': -1.0, 'right_t': -1.0}, 'Medium', 0.3, integrity)
+                result = {
+                    'gaze_label':   'Off-screen',
+                    'gaze_vals':    {'left_t': -1.0, 'right_t': -1.0},
+                    'stress_level': 'Medium',
+                    'stress_score': 0.3,
+                    'emotion':      'Neutral',
+                    'integrity':    integrity,
+                    'calibrating':  False,
+                }
+                draw_overlay(frame, {}, result, fps)
                 cv2.imshow('Sentin-Edge AI', frame)
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     break
                 continue
 
-            # Use the realtime analyzer (calibrates for first N frames)
-            gaze_label, gaze_vals, stress_level, stress_score, integrity = analyzer.update(kp)
-            # If analyzer is still calibrating, show progress label
-            if gaze_label == 'Calibrating':
-                draw_overlay(frame, kp, 'Calibrating...', {'left_t': gaze_vals.get('left_t', -1.0) if isinstance(gaze_vals, dict) else -1.0, 'right_t': gaze_vals.get('right_t', -1.0) if isinstance(gaze_vals, dict) else -1.0}, 'Low', 0.0, integrity)
-            else:
-                draw_overlay(frame, kp, gaze_label, gaze_vals, stress_level, stress_score, integrity)
+            # ── Run analyser ────────────────────────────────────────
+            result = analyzer.update(kp, frame)
+            integrity = result['integrity']
 
+            draw_overlay(frame, kp, result, fps)
             cv2.imshow('Sentin-Edge AI', frame)
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
-
-            # tiny sleep to ease CPU usage on some devices
-            time.sleep(0.001)
 
     finally:
         cap.release()
