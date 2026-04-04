@@ -10,7 +10,7 @@ import time
 import cv2
 import numpy as np
 from vision_engine import VisionEngine
-from analytics import compute_gaze, compute_stress, compute_integrity
+from analytics import compute_gaze, compute_integrity, RealtimeAnalyzer
 
 
 def draw_overlay(frame, kp, gaze_label, gaze_vals, stress_level, stress_score, integrity_score):
@@ -50,7 +50,8 @@ def main():
         return
 
     engine = VisionEngine()
-    integrity = 100.0
+    analyzer = RealtimeAnalyzer(window=12, calib_frames=30)
+    integrity = analyzer.prev_integrity
     last_time = time.time()
 
     try:
@@ -61,7 +62,7 @@ def main():
 
             kp = engine.process(frame)
             if kp is None:
-                # No face: decay integrity slowly
+                # No face: decay integrity slowly and show off-screen
                 integrity = compute_integrity(integrity, 'Off-screen', 'Medium', 0.3)
                 draw_overlay(frame, {}, 'Off-screen', {'left_t': -1.0, 'right_t': -1.0}, 'Medium', 0.3, integrity)
                 cv2.imshow('Sentin-Edge AI', frame)
@@ -69,11 +70,13 @@ def main():
                     break
                 continue
 
-            gaze_label, gaze_vals = compute_gaze(kp)
-            stress_level, stress_score = compute_stress(kp)
-            integrity = compute_integrity(integrity, gaze_label, stress_level, stress_score)
-
-            draw_overlay(frame, kp, gaze_label, gaze_vals, stress_level, stress_score, integrity)
+            # Use the realtime analyzer (calibrates for first N frames)
+            gaze_label, gaze_vals, stress_level, stress_score, integrity = analyzer.update(kp)
+            # If analyzer is still calibrating, show progress label
+            if gaze_label == 'Calibrating':
+                draw_overlay(frame, kp, 'Calibrating...', {'left_t': gaze_vals.get('left_t', -1.0) if isinstance(gaze_vals, dict) else -1.0, 'right_t': gaze_vals.get('right_t', -1.0) if isinstance(gaze_vals, dict) else -1.0}, 'Low', 0.0, integrity)
+            else:
+                draw_overlay(frame, kp, gaze_label, gaze_vals, stress_level, stress_score, integrity)
 
             cv2.imshow('Sentin-Edge AI', frame)
             if cv2.waitKey(1) & 0xFF == ord('q'):
