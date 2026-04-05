@@ -86,6 +86,30 @@ def draw_overlay(frame, kp, result, fps):
     put(f'Integrity: {int(integrity)}', col=_integrity_colour(integrity))
     put(f'FPS: {fps:.0f}', col=COL_CYAN, scale=0.5, thickness=1)
 
+    # ── Environment Quality Meter ───────────────────────────────────
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    mean_bright = gray.mean()
+    lap_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+    put(f'Env Bright: {mean_bright:.0f}  Blur: {lap_var:.0f}', scale=0.5)
+    
+    if mean_bright < 40.0:
+        put('WARNING: Environment Too Dark!', col=COL_RED, scale=0.5)
+    elif lap_var < 50.0:
+        put('WARNING: Image Too Blurry!', col=COL_RED, scale=0.5)
+
+    # ── Confidence Heatmap ──────────────────────────────────────────
+    conf = gaze_vals.get('confidence', 0.5)
+    h, w = frame.shape[:2]
+    cx, cy = w - 50, 50
+    radius = int(25 * conf)
+    cv2.circle(frame, (cx, cy), 25, (80, 80, 80), 2)  # Outer bounding ring
+    
+    # Heatmap color
+    conf_col = COL_GREEN if conf > 0.7 else (COL_YELLOW if conf > 0.4 else COL_RED)
+    cv2.circle(frame, (cx, cy), radius, conf_col, -1)
+    cv2.putText(frame, f'Conf: {conf*100:.0f}%', (cx - 30, cy + 40),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, COL_WHITE, 1, cv2.LINE_AA)
+
     # ── Draw Eye & Iris Structural Geometries (Mesh Contours) ───────────
     draw_keys = ('left_eye_points', 'right_eye_points', 'left_iris_pts', 'right_iris_pts', 'left_iris', 'right_iris')
     if all(k in kp for k in draw_keys):
