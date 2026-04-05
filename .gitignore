@@ -34,6 +34,7 @@ Thumbs.db
 # Datasets and processed data
 MPIIGAZE/
 FER-2013/
+Dataset/
 *.csv
 *.jsonl
 *.task
