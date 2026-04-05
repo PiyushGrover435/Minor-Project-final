@@ -1,17 +1,23 @@
+import argparse
 import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
+
 from load_fer2013 import get_fer2013_dataloaders
+
+# Penultimate embedding size (texture / forehead cues); must match AffectiveHead / MultiModalStressTCN.
+DEFAULT_EMBED_DIM = 512
+
 
 class EmotionCNN(nn.Module):
     """
-    Lightweight CNN for edge deployment.
-    Input: 1x48x48
-    Output: 7 emotion classes
+    Grayscale 48×48 CNN. Penultimate layer is embed_dim-D for distress-relevant texture.
     """
-    def __init__(self):
-        super(EmotionCNN, self).__init__()
+
+    def __init__(self, embed_dim: int = DEFAULT_EMBED_DIM):
+        super().__init__()
+        self.embed_dim = int(embed_dim)
         self.features = nn.Sequential(
             nn.Conv2d(1, 32, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
@@ -20,26 +26,24 @@ class EmotionCNN(nn.Module):
             nn.ReLU(inplace=True),
             nn.MaxPool2d(2, 2),
             nn.Dropout2d(0.25),
-            
             nn.Conv2d(64, 128, kernel_size=3, padding=1),
             nn.BatchNorm2d(128),
             nn.ReLU(inplace=True),
             nn.MaxPool2d(2, 2),
             nn.Dropout2d(0.25),
-            
             nn.Conv2d(128, 128, kernel_size=3, padding=1),
             nn.BatchNorm2d(128),
             nn.ReLU(inplace=True),
             nn.MaxPool2d(2, 2),
-            nn.Dropout2d(0.25)
+            nn.Dropout2d(0.25),
         )
-        
+
         self.classifier = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(128 * 6 * 6, 256),
+            nn.Linear(128 * 6 * 6, self.embed_dim),
             nn.ReLU(inplace=True),
             nn.Dropout(0.5),
-            nn.Linear(256, 7)
+            nn.Linear(self.embed_dim, 7),
         )
 
     def forward(self, x):
@@ -47,42 +51,44 @@ class EmotionCNN(nn.Module):
         x = self.classifier(x)
         return x
 
-def train_affective_cnn(epochs=5, batch_size=64):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
-    
+
+def train_affective_cnn(epochs=5, batch_size=64, embed_dim=DEFAULT_EMBED_DIM):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}, embed_dim={embed_dim}")
+
     base = os.path.join("Dataset", "FER-2013")
-    train_loader, test_loader, class_idx = get_fer2013_dataloaders(base, batch_size=batch_size, num_workers=2)
-    
-    model = EmotionCNN().to(device)
+    train_loader, test_loader, class_idx = get_fer2013_dataloaders(
+        base, batch_size=batch_size, num_workers=2
+    )
+
+    model = EmotionCNN(embed_dim=embed_dim).to(device)
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
-    # Simple learning rate scheduler
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=2)
-    
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="max", factor=0.5, patience=2
+    )
+
     best_acc = 0.0
     out_dir = "models"
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, "affective_cnn.pth")
-    
+
     for epoch in range(epochs):
         model.train()
-        running_loss = 0.0
-        
         for i, (images, labels) in enumerate(train_loader):
             images, labels = images.to(device), labels.to(device)
-            
+
             optimizer.zero_grad()
             outputs = model(images)
             loss = criterion(outputs, labels)
             loss.backward()
             optimizer.step()
-            
-            running_loss += loss.item()
+
             if (i + 1) % 100 == 0:
-                print(f"Epoch [{epoch+1}/{epochs}], Step [{i+1}/{len(train_loader)}], Loss: {loss.item():.4f}")
-                
-        # Evaluate
+                print(
+                    f"Epoch [{epoch+1}/{epochs}], Step [{i+1}/{len(train_loader)}], Loss: {loss.item():.4f}"
+                )
+
         model.eval()
         correct = 0
         total = 0
@@ -93,16 +99,29 @@ def train_affective_cnn(epochs=5, batch_size=64):
                 _, predicted = torch.max(outputs.data, 1)
                 total += labels.size(0)
                 correct += (predicted == labels).sum().item()
-                
+
         acc = 100 * correct / total
         print(f"Validation Accuracy after Epoch {epoch+1}: {acc:.2f}%")
         scheduler.step(acc)
-        
+
         if acc > best_acc:
             best_acc = acc
             torch.save(model.state_dict(), out_path)
             print("Saved best model.")
 
+    print(f"Best accuracy: {best_acc:.2f}% -> {out_path}")
+
+
+def main():
+    p = argparse.ArgumentParser(description="Train FER affective CNN")
+    p.add_argument("--epochs", type=int, default=15)
+    p.add_argument("--batch_size", type=int, default=128)
+    p.add_argument("--embed_dim", type=int, default=DEFAULT_EMBED_DIM)
+    args = p.parse_args()
+    train_affective_cnn(
+        epochs=args.epochs, batch_size=args.batch_size, embed_dim=args.embed_dim
+    )
+
+
 if __name__ == "__main__":
-    # We will just train for 15 epochs since it's fast on GPU.
-    train_affective_cnn(epochs=15, batch_size=128)
+    main()
