@@ -83,6 +83,17 @@ def draw_overlay(frame, kp, result, fps):
     emotion = result.get('emotion', 'Neutral')
     put(f'Emotion: {emotion}')
     put(f'Stress: {stress_level} ({stress_score:.2f})')
+    bb = result.get('blink_bpm', 0.0)
+    bbl = result.get('blink_baseline_bpm')
+    bz = result.get('blink_zscore', 0.0)
+    mt = result.get('micro_tremor', 0.0)
+    distress = result.get('emotional_distress', False)
+    v = result.get('valence', 0.0)
+    a = result.get('arousal', 0.0)
+    put(f'Blink: {bb:.1f}/min  z={bz:.2f}' + (f'  base~{bbl:.1f}' if bbl is not None else ''), scale=0.55, thickness=1)
+    put(f'Micro-tremor: {mt:.2f}  V={v:+.2f} A={a:.2f}', scale=0.55, thickness=1)
+    dcol = COL_RED if distress else COL_GREEN
+    put(f'Distress: {"YES" if distress else "no"}', col=dcol, scale=0.65, thickness=2)
     put(f'Integrity: {int(integrity)}', col=_integrity_colour(integrity))
     put(f'FPS: {fps:.0f}', col=COL_CYAN, scale=0.5, thickness=1)
 
@@ -141,7 +152,7 @@ def main():
         return
 
     engine   = VisionEngine()
-    analyzer = RealtimeAnalyzer(window=12, calib_frames=30)
+    analyzer = RealtimeAnalyzer(window=12, calib_frames=30, gaze_seq_len=18)
     integrity = analyzer.prev_integrity
     calibrator = CalibrationEngine()
     smoother  = KeypointSmoother()
@@ -194,6 +205,13 @@ def main():
                     'emotion':      'Neutral',
                     'integrity':    integrity,
                     'calibrating':  False,
+                    'blink_bpm': 0.0,
+                    'blink_baseline_bpm': None,
+                    'blink_zscore': 0.0,
+                    'micro_tremor': 0.0,
+                    'emotional_distress': False,
+                    'valence': 0.0,
+                    'arousal': 0.35,
                 }
                 # If calibrating, keep showing calibration UI even if face blinks out
                 display_frame, is_calib = calibrator.update_and_draw((frame.shape[0], frame.shape[1]), None, frame, analyzer.gaze_head)

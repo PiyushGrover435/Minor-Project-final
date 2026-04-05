@@ -3,12 +3,27 @@ analytics.py
 
 Gaze and stress math utilities.
 Optimized with NumPy vector ops and small, deterministic heuristics suitable for on-device use.
+
+Emotional-distress cues: blink rate vs post-calibration baseline (1.5σ), eyebrow y-variance
+(micro-tremor proxy), fused with the affective CNN+TCN score.
 """
 import numpy as np
 from collections import deque
 
 # Small epsilon to avoid division-by-zero
 EPS = 1e-6
+
+# ── Blink rate → distress (resting ~15–20 / min; stress often ~2×) ───
+BLINK_RING_MAXLEN = 900
+ASSUMED_FPS = 30.0
+BLINK_BASELINE_FRAMES = 150
+BLINK_SIGMA_MULT = 1.5
+MIN_BLINK_BPM_SIGMA = 2.5
+
+# ── Brow micro-tremor (y-variance, normalised by interocular scale) ─
+BROW_Y_RING_MAXLEN = 24
+MICRO_TREMOR_VAR_SCALE = 2.8e-4
+MICRO_TREMOR_DISTRESS_THRESH = 0.62
 
 # ── Gaze thresholds ─────────────────────────────────────────────────
 OFFSCREEN_LO = -0.15
@@ -186,7 +201,7 @@ from affective_head import AffectiveHead
 class RealtimeAnalyzer:
     """Realtime analyzer with temporal smoothing and ML heads fallback."""
 
-    def __init__(self, window=15, calib_frames=30):
+    def __init__(self, window=15, calib_frames=30, gaze_seq_len=15):
         self.window       = int(window)
         self.calib_frames = int(calib_frames)
 
@@ -195,7 +210,7 @@ class RealtimeAnalyzer:
         self.prev_integrity = 100.0
         
         # Load ML heads (graceful fallback inside if models missing)
-        self.gaze_head = GazeHead()
+        self.gaze_head = GazeHead(seq_len=int(gaze_seq_len))
         self.affective_head = AffectiveHead()
 
         # Calibration state
@@ -210,6 +225,18 @@ class RealtimeAnalyzer:
         self.blink_suppress       = 0
         self.blink_threshold      = 0.015   # fallback; updated after calibration
         self.blink_suppress_frames = 4
+        self._prev_eye_closed     = False
+
+        # Blink-rate ring (1 = blink onset this frame) → estimated BPM
+        self._blink_ring          = deque(maxlen=BLINK_RING_MAXLEN)
+        self._blink_bpm_samples   = []
+        self._blink_baseline_mu   = None
+        self._blink_baseline_sig  = None
+        self._blink_baseline_done = False
+        self._post_calib_frames   = 0
+
+        # Eyebrow vertical micro-movement (high-frequency variance proxy)
+        self._brow_y_ring         = deque(maxlen=BROW_Y_RING_MAXLEN)
 
     # ── Helper: raw brow-eyelid distance ────────────────────────────
 
@@ -246,19 +273,91 @@ class RealtimeAnalyzer:
 
     def _make_result(self, gaze_label, gaze_vals, stress_level, stress_score,
                      integrity, calibrating=False, calib_remaining=0, emotion='Neutral',
-                     head_pose=(0.0, 0.0, 0.0)):
+                     head_pose=(0.0, 0.0, 0.0), blink_bpm=0.0, blink_baseline_bpm=None,
+                     blink_zscore=0.0, micro_tremor=0.0, emotional_distress=False,
+                     valence=0.0, arousal=0.0):
         """Uniform result dict for all return paths."""
         return {
-            'gaze_label':      gaze_label,
-            'gaze_vals':       gaze_vals,
-            'stress_level':    stress_level,
-            'stress_score':    stress_score,
-            'emotion':         emotion,
-            'integrity':       integrity,
-            'calibrating':     calibrating,
-            'calib_remaining': calib_remaining,
-            'head_pose':       head_pose,
+            'gaze_label':           gaze_label,
+            'gaze_vals':            gaze_vals,
+            'stress_level':         stress_level,
+            'stress_score':         stress_score,
+            'emotion':              emotion,
+            'integrity':            integrity,
+            'calibrating':          calibrating,
+            'calib_remaining':      calib_remaining,
+            'head_pose':            head_pose,
+            'blink_bpm':            float(blink_bpm),
+            'blink_baseline_bpm':   None if blink_baseline_bpm is None else float(blink_baseline_bpm),
+            'blink_zscore':         float(blink_zscore),
+            'micro_tremor':         float(micro_tremor),
+            'emotional_distress':   bool(emotional_distress),
+            'valence':              float(valence),
+            'arousal':              float(arousal),
         }
+
+    def _estimate_blink_bpm(self):
+        """Blinks per minute from recent blink-onset counts in the ring."""
+        n = len(self._blink_ring)
+        if n < 30:
+            return 0.0
+        s = float(sum(self._blink_ring))
+        return s * 60.0 * ASSUMED_FPS / float(n)
+
+    def _update_blink_rate_baseline(self, bpm):
+        """After calibration, collect BPM samples then fix μ, σ for distress tests."""
+        if self._blink_baseline_done:
+            return
+        self._post_calib_frames += 1
+        self._blink_bpm_samples.append(bpm)
+        if len(self._blink_bpm_samples) >= BLINK_BASELINE_FRAMES:
+            arr = np.asarray(self._blink_bpm_samples, dtype=np.float64)
+            self._blink_baseline_mu = float(np.median(arr))
+            self._blink_baseline_sig = float(max(np.std(arr), MIN_BLINK_BPM_SIGMA))
+            self._blink_baseline_done = True
+
+    def _blink_rate_zscore(self, bpm):
+        if not self._blink_baseline_done or self._blink_baseline_sig is None:
+            return 0.0
+        z = (bpm - self._blink_baseline_mu) / max(self._blink_baseline_sig, EPS)
+        return float(max(0.0, z))
+
+    def _blink_distress(self, bpm):
+        if not self._blink_baseline_done or self._blink_baseline_sig is None:
+            return False
+        return bpm > self._blink_baseline_mu + BLINK_SIGMA_MULT * self._blink_baseline_sig
+
+    def _micro_tremor_norm(self, keypoints):
+        """Normalised variance of mean eyebrow y (screen coords / interocular)."""
+        if not all(k in keypoints for k in ('left_eyebrow', 'right_eyebrow', 'left_inner', 'right_inner')):
+            return 0.0
+        io = _interocular(keypoints)
+        if io < EPS:
+            io = 1.0
+        ly = float(keypoints['left_eyebrow'][1]) / io
+        ry = float(keypoints['right_eyebrow'][1]) / io
+        self._brow_y_ring.append(0.5 * (ly + ry))
+        if len(self._brow_y_ring) < 5:
+            return 0.0
+        var_y = float(np.var(np.asarray(self._brow_y_ring, dtype=np.float64)))
+        return float(np.clip(var_y / MICRO_TREMOR_VAR_SCALE, 0.0, 1.0))
+
+    @staticmethod
+    def _valence_arousal_proxy(emotion: str, stress_score: float, micro_tremor: float, blink_z: float):
+        """Rough V–A mapping (AU / distress literature–inspired heuristic, not DISFA-trained)."""
+        e = emotion.lower()
+        neg = {'angry', 'disgust', 'fear', 'sad'}
+        pos = {'happy'}
+        if e in neg:
+            v = -0.65
+        elif e in pos:
+            v = 0.55
+        elif e == 'surprise':
+            v = 0.1
+        else:
+            v = 0.0
+        a = float(np.clip(0.55 * stress_score + 0.25 * micro_tremor + 0.2 * min(blink_z / 3.0, 1.0), 0.0, 1.0))
+        return v, a
 
     def update(self, keypoints, frame=None):
         """
@@ -266,45 +365,68 @@ class RealtimeAnalyzer:
 
         Returns
         -------
-        dict with keys: gaze_label, gaze_vals, stress_level, stress_score, emotion,
-                        integrity, calibrating, calib_remaining, head_pose
+        dict including gaze, stress, emotion, integrity, blink_bpm, micro_tremor,
+        emotional_distress, valence, arousal (V–A are heuristic proxies).
         """
         hp = keypoints.get('head_pose', (0.0, 0.0, 0.0))
-        
-        # ML Gaze Head prediction
+        rx, ry, rz = hp
+
         gaze_label, gaze_vals = self.gaze_head.predict(keypoints, frame)
-        
+
         raw = self._raw_brow_eyelid_dist(keypoints)
         if raw is None:
-            # Fallback if no face
             emotion, ml_level, ml_score = self.affective_head.predict(keypoints, frame)
-            return self._make_result(gaze_label, gaze_vals, 'Low', 0.0,
-                                     self.prev_integrity, emotion=emotion, head_pose=hp)
+            return self._make_result(
+                gaze_label, gaze_vals, 'Low', 0.0, self.prev_integrity,
+                emotion=emotion, head_pose=hp,
+            )
 
         eye_open = self._eye_opening_ratio(keypoints)
-        
-        # Phase 1: Micro-tremor / blink state / posture extraction for Affective Multi-Modal TCN
-        delta_brow_norm = 0.0
-        # If calibrated, measure deviation from baseline as a robust micro-tremor indicator
-        if hasattr(self, '_baseline_dist') and self._baseline_dist is not None:
-            delta_brow_norm = self._baseline_dist - raw
-            
-        blink_state = 0.0
-        if hasattr(self, 'blink_buf') and len(self.blink_buf) > 0:
+        if eye_open is not None:
+            self.blink_buf.append(eye_open)
+
+        closed_now = False
+        if len(self.blink_buf) >= 3:
             try:
-                if float(np.median(self.blink_buf)) < self.blink_threshold:
-                    blink_state = 1.0
+                closed_now = float(np.median(self.blink_buf)) < self.blink_threshold
             except Exception:
-                pass
-                
-        rx, ry, rz = keypoints.get('head_pose', (0.0, 0.0, 0.0))
-                
-        # ML Affective Head prediction (Multi-Modal TCN)
-        emotion, ml_level, ml_score = self.affective_head.predict(
-            keypoints, frame, temporal_geometries=(delta_brow_norm, blink_state, rx, ry, rz)
+                closed_now = False
+
+        if closed_now and not self._prev_eye_closed:
+            self._blink_ring.append(1)
+        else:
+            self._blink_ring.append(0)
+        self._prev_eye_closed = closed_now
+
+        blink_state = 1.0 if closed_now else 0.0
+        micro_tremor = self._micro_tremor_norm(keypoints)
+        bpm = self._estimate_blink_bpm()
+
+        delta_brow_norm = 0.0
+        if self._baseline_dist is not None:
+            delta_brow_norm = self._baseline_dist - raw
+
+        blink_z = 0.0
+        blink_z_feat = 0.0
+        if self._calibrated:
+            self._update_blink_rate_baseline(bpm)
+            blink_z = self._blink_rate_zscore(bpm)
+            blink_z_feat = float(np.clip(blink_z / 3.0, 0.0, 1.0))
+
+        temporal = (
+            float(delta_brow_norm),
+            float(blink_state),
+            float(micro_tremor),
+            float(blink_z_feat),
+            float(rx),
+            float(ry),
+            float(rz),
         )
 
-        # ── Calibration phase ───────────────────────────────────────
+        emotion, ml_level, ml_score = self.affective_head.predict(
+            keypoints, frame, temporal_geometries=temporal
+        )
+
         if not self._calibrated:
             self._calib_vals.append(raw)
             if eye_open is not None:
@@ -322,43 +444,52 @@ class RealtimeAnalyzer:
                     self.blink_threshold = self._baseline_eye_open * 0.7
 
                 self._calibrated = True
+                self._blink_baseline_done = False
+                self._blink_bpm_samples = []
+                self._post_calib_frames = 0
 
-            return self._make_result('Calibrating', gaze_vals, 'Low', 0.0,
-                                     self.prev_integrity,
-                                     calibrating=True, calib_remaining=remaining, emotion=emotion,
-                                     head_pose=hp)
+            return self._make_result(
+                'Calibrating', gaze_vals, 'Low', 0.0, self.prev_integrity,
+                calibrating=True, calib_remaining=remaining, emotion=emotion,
+                head_pose=hp, blink_bpm=bpm, micro_tremor=micro_tremor,
+            )
 
-        # ── Compute stress delta from calibrated baseline ───────────
         delta = self._baseline_dist - raw
-        norm  = delta / max(self._baseline_dist, EPS)
+        norm = delta / max(self._baseline_dist, EPS)
         score = float(np.clip(norm / 0.6, 0.0, 1.0))
 
-        # Temporal smoothing
         self.stress_buf.append(score)
         smooth = float(np.mean(self.stress_buf))
 
-        # ── Blink detection & suppression ───────────────────────────
         if eye_open is not None:
-            self.blink_buf.append(eye_open)
             try:
                 if float(np.median(self.blink_buf)) < self.blink_threshold:
                     self.blink_suppress = self.blink_suppress_frames
             except Exception:
                 pass
 
+        blink_distress = self._blink_distress(bpm)
+        tremor_distress = micro_tremor >= MICRO_TREMOR_DISTRESS_THRESH
+
         if self.blink_suppress > 0:
             self.blink_suppress -= 1
             smooth = float(np.mean(self.stress_buf)) if self.stress_buf else ml_score
             integrity = compute_integrity(self.prev_integrity, gaze_label, 'Low', smooth)
             self.prev_integrity = integrity
-            return self._make_result(gaze_label, gaze_vals, 'Low', smooth, integrity, emotion=emotion, head_pose=hp)
+            v, a = self._valence_arousal_proxy(emotion, smooth, micro_tremor, blink_z)
+            distress = blink_distress or tremor_distress or (smooth >= 0.65)
+            return self._make_result(
+                gaze_label, gaze_vals, 'Low', smooth, integrity,
+                emotion=emotion, head_pose=hp, blink_bpm=bpm,
+                blink_baseline_bpm=self._blink_baseline_mu,
+                blink_zscore=blink_z, micro_tremor=micro_tremor,
+                emotional_distress=distress, valence=v, arousal=a,
+            )
 
-        # Override if ML model provides higher confidence structure
-        if hasattr(self.affective_head, 'tcn') and self.affective_head.tcn is not None:
+        if self.affective_head.feature_extractor is not None:
             smooth = ml_score
             level = ml_level
         else:
-            # Classification based on heuristic
             if smooth >= 0.6:
                 level = 'High'
             elif smooth >= 0.25:
@@ -369,4 +500,18 @@ class RealtimeAnalyzer:
         integrity = compute_integrity(self.prev_integrity, gaze_label, level, smooth)
         self.prev_integrity = integrity
 
-        return self._make_result(gaze_label, gaze_vals, level, smooth, integrity, emotion=emotion, head_pose=hp)
+        v, a = self._valence_arousal_proxy(emotion, smooth, micro_tremor, blink_z)
+        distress = (
+            blink_distress
+            or tremor_distress
+            or (level == 'High')
+            or (smooth >= 0.68)
+        )
+
+        return self._make_result(
+            gaze_label, gaze_vals, level, smooth, integrity,
+            emotion=emotion, head_pose=hp, blink_bpm=bpm,
+            blink_baseline_bpm=self._blink_baseline_mu,
+            blink_zscore=blink_z, micro_tremor=micro_tremor,
+            emotional_distress=distress, valence=v, arousal=a,
+        )
