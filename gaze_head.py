@@ -201,6 +201,14 @@ class GazeHead:
             gaze_vals['screen_x'] = float(x_norm)
             gaze_vals['screen_y'] = float(y_norm)
             
+            # Predict pseudo softmax confidence based on geometric jitter (low variance = high confidence)
+            if len(self.patch_buffer) > 1:
+                variance = float(np.var(self.patch_buffer, axis=0).mean())
+                conf = max(0.1, 1.0 - (variance * 150.0))
+            else:
+                conf = 0.5
+            gaze_vals['confidence'] = min(0.99, conf)
+            
             return label, gaze_vals
 
     def fine_tune(self, keypoints, frame, target_x_norm, target_y_norm):
