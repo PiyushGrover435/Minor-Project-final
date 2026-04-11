@@ -5,7 +5,10 @@ Gaze and stress math utilities.
 Optimized with NumPy vector ops and small, deterministic heuristics suitable for on-device use.
 
 Emotional-distress cues: blink rate vs post-calibration baseline (1.5σ), eyebrow y-variance
-(micro-tremor proxy), fused with the affective CNN+TCN score.
+(micro-tremor proxy), AU4/AU12 temporal velocity/acceleration (micro-expression onset detection),
+fused with the affective CNN+TCN score.
+
+All processing is privacy-first and performed entirely in-memory.
 """
 import numpy as np
 from collections import deque
@@ -25,19 +28,40 @@ BROW_Y_RING_MAXLEN = 24
 MICRO_TREMOR_VAR_SCALE = 2.8e-4
 MICRO_TREMOR_DISTRESS_THRESH = 0.62
 
+# ── AU Temporal Dynamics (velocity / acceleration spike detection) ──
+AU_HISTORY_LEN        = 20     # rolling window of AU activations
+AU4_VEL_SPIKE_THRESH  = 0.08   # normalised velocity threshold for AU4 spike
+AU12_VEL_SPIKE_THRESH = 0.06   # normalised velocity threshold for AU12 spike
+AU_ACCEL_SPIKE_THRESH = 0.04   # acceleration threshold for micro-expression onset
+SPIKE_COOLDOWN_FRAMES = 10     # min frames between consecutive spike detections
+
 # ── Gaze thresholds ─────────────────────────────────────────────────
 OFFSCREEN_LO = -0.15
 OFFSCREEN_HI =  1.15
 CENTER_LO    =  0.35
 CENTER_HI    =  0.65
 
+# ── Biometric Gaze Engine (Fixation & Saccade) ──────────────────────
+# Fixation: consecutive frames where gaze variance stays within range
+FIXATION_VARIANCE_THRESH  = 0.08    # max gaze_avg variance for fixation (lenient)
+FIXATION_RING_MAXLEN      = 30      # 1-second window at 30 FPS
+FIXATION_MIN_DURATION_MS  = 180.0   # below this → unstable gaze → integrity penalty
+# Saccade: rapid eye jump between screen zones
+SACCADE_VEL_THRESH        = 0.12    # frame-to-frame gaze_avg delta threshold
+SACCADE_RING_MAXLEN       = 60      # 2-second window for saccade rate (at 30 FPS)
+SACCADE_RATE_PENALTY_THRESH = 4.0   # saccades/sec above which integrity is penalised
+# Integrity tuning for fixation & saccade
+FIX_SHORT_PENALTY         = 0.5     # mild penalty when fixation duration < 180 ms
+SACCADE_STRESS_PENALTY    = 1.5     # penalty when high saccade rate during stress spike
+
 # ── Integrity tuning knobs ──────────────────────────────────────────
-INTEGRITY_DECAY       =  0.05   # tiny continuous decay per frame
-STRESS_WEIGHT         =  5.0    # penalty multiplier for stress score
-OFFSCREEN_PENALTY     = 10.0    # penalty when gaze is off-screen
-COMBO_PENALTY         = 40.0    # extra penalty: off-screen + high stress
-RECOVERY_REWARD       =  2.0    # reward when gaze is Center + stress Low
-INTEGRITY_EMA_ALPHA   =  0.12   # EMA smoothing for integrity score
+INTEGRITY_DECAY       =  0.02   # tiny continuous decay per frame
+STRESS_WEIGHT         =  2.5    # penalty multiplier for stress score
+OFFSCREEN_PENALTY     =  6.0    # penalty when gaze is off-screen
+COMBO_PENALTY         = 15.0    # extra penalty: off-screen + high stress
+RECOVERY_REWARD       =  3.5    # reward when gaze is Center + stress Low
+RECOVERY_ONSCREEN     =  1.0    # smaller reward when gaze is on-screen (any stress)
+INTEGRITY_EMA_ALPHA   =  0.08   # EMA smoothing for integrity score (slower = more stable)
 
 
 def _proj_ratio(pt, a, b):
@@ -54,12 +78,22 @@ def _proj_ratio(pt, a, b):
 
 
 # ────────────────────────────────────────────────────────────────────
-#  Gaze Head
+#  Gaze Head  (heuristic fallback — used when ML model unavailable)
 # ────────────────────────────────────────────────────────────────────
+
+# Head-pose compensation: degrees of yaw/pitch that shift the gaze ratio
+# toward center by this fraction per degree, preventing false cheating alerts.
+_YAW_COMP_PER_DEG    = 0.006   # ~0.6% per degree of yaw
+_PITCH_COMP_PER_DEG  = 0.003   # ~0.3% per degree of pitch
+_MAX_YAW_COMP        = 0.15    # cap total yaw compensation
+_MAX_PITCH_COMP      = 0.08    # cap total pitch compensation
+
 
 def compute_gaze(keypoints):
     """
-    Compute gaze direction label and numeric ratios.
+    Compute gaze direction label and numeric ratios, with optional
+    head-pose compensation to prevent false-positive off-screen alerts
+    when the user merely shifts their head.
 
     Returns
     -------
@@ -75,6 +109,24 @@ def compute_gaze(keypoints):
 
     left_t  = _proj_ratio(keypoints['left_iris'],  keypoints['left_inner'],  keypoints['left_outer'])
     right_t = _proj_ratio(keypoints['right_iris'],  keypoints['right_inner'], keypoints['right_outer'])
+
+    # ── Head-pose compensation (6-DOF solvePnP) ────────────────────
+    # When the head rotates (yaw/pitch), the iris projection shifts
+    # even when the user is still fixating on the screen.  Compensate
+    # by nudging the ratio back toward 0.5 (centre) proportionally.
+    hp = keypoints.get('head_pose')
+    if hp is not None and len(hp) >= 2:
+        pitch, yaw = float(hp[0]), float(hp[1])
+
+        # Yaw compensation: positive yaw → head turned right → iris appears left
+        yaw_comp = float(np.clip(yaw * _YAW_COMP_PER_DEG,
+                                 -_MAX_YAW_COMP, _MAX_YAW_COMP))
+        # Pitch compensation: positive pitch → head tilted up → iris appears higher
+        pitch_comp = float(np.clip(pitch * _PITCH_COMP_PER_DEG,
+                                   -_MAX_PITCH_COMP, _MAX_PITCH_COMP))
+
+        left_t  += yaw_comp + pitch_comp
+        right_t += yaw_comp + pitch_comp
 
     # Off-screen when iris projects well beyond eye corners
     if not (OFFSCREEN_LO <= left_t <= OFFSCREEN_HI and
@@ -152,16 +204,21 @@ def compute_stress(keypoints):
 #  Integrity Engine
 # ────────────────────────────────────────────────────────────────────
 
-def compute_integrity(prev_score, gaze_label, stress_level, stress_score):
+def compute_integrity(prev_score, gaze_label, stress_level, stress_score,
+                      fixation_dur_ms=300.0, saccade_rate=0.0,
+                      stress_spike=False):
     """
-    Real-time Integrity Score logic.
+    Real-time Integrity Score logic with biometric gaze adjustments.
 
     Parameters
     ----------
-    prev_score   : float | None – previous score in 0..100 (None → start at 100)
-    gaze_label   : str
-    stress_level : str
-    stress_score : float
+    prev_score      : float | None – previous score in 0..100 (None → start at 100)
+    gaze_label      : str
+    stress_level    : str
+    stress_score    : float
+    fixation_dur_ms : float – current fixation duration in milliseconds
+    saccade_rate    : float – saccades per second in the recent window
+    stress_spike    : bool  – whether a micro-expression stress spike is active
 
     Returns
     -------
@@ -181,9 +238,20 @@ def compute_integrity(prev_score, gaze_label, stress_level, stress_score):
     if gaze_label == 'Off-screen' and stress_level == 'High':
         score -= COMBO_PENALTY
 
-    # Recovery reward: gaze on-screen and relaxed → slowly regain points
+    # ── Biometric gaze penalties ────────────────────────────────────
+    # Short fixation: gaze instability → penalise
+    if fixation_dur_ms < FIXATION_MIN_DURATION_MS:
+        score -= FIX_SHORT_PENALTY
+
+    # High saccade rate during stress spike → compounding penalty
+    if saccade_rate > SACCADE_RATE_PENALTY_THRESH and stress_spike:
+        score -= SACCADE_STRESS_PENALTY
+
+    # Recovery rewards
     if gaze_label == 'Center' and stress_level == 'Low':
-        score += RECOVERY_REWARD
+        score += RECOVERY_REWARD       # full recovery: attentive + calm
+    elif gaze_label in ('Center', 'Left', 'Right'):
+        score += RECOVERY_ONSCREEN     # partial recovery: on-screen but stressed
 
     score = max(0.0, min(100.0, score))
 
@@ -238,6 +306,162 @@ class RealtimeAnalyzer:
         # Eyebrow vertical micro-movement (high-frequency variance proxy)
         self._brow_y_ring         = deque(maxlen=BROW_Y_RING_MAXLEN)
 
+        # ── AU Temporal Dynamics (20-frame rolling buffer) ──────────
+        self._au4_history  = deque(maxlen=AU_HISTORY_LEN)   # normalised AU4 activation per frame
+        self._au12_history = deque(maxlen=AU_HISTORY_LEN)   # normalised AU12 activation per frame
+        self._au4_vel_history  = deque(maxlen=AU_HISTORY_LEN)
+        self._au12_vel_history = deque(maxlen=AU_HISTORY_LEN)
+        self._spike_cooldown   = 0
+        self._last_stress_spike = False
+
+        # ── Biometric Gaze Engine (Fixation & Saccade) ─────────────
+        self._gaze_avg_ring    = deque(maxlen=FIXATION_RING_MAXLEN)   # rolling gaze avg
+        self._fixation_frames  = 0        # consecutive frames within variance threshold
+        self._fixation_dur_ms  = 0.0      # current fixation duration in ms
+        self._prev_gaze_avg    = None     # previous frame's gaze avg (for saccade vel)
+        self._saccade_ring     = deque(maxlen=SACCADE_RING_MAXLEN)    # 1=saccade this frame
+        self._saccade_rate     = 0.0      # saccades per second (recent window)
+        self._prev_gaze_zone   = None     # previous gaze zone label
+
+    # ── AU4 / AU12 Activation Extraction ────────────────────────────
+
+    @staticmethod
+    def _compute_au4_activation(keypoints):
+        """
+        AU4 (Brow Lowerer): measures inner eyebrow depression relative to
+        nose bridge, normalised by inter-ocular distance.
+
+        Higher value → brows pulled *down* more → greater AU4 activation.
+        All computation is in-memory vector math.
+        """
+        req = ('left_inner_brow', 'right_inner_brow', 'nose_bridge',
+               'left_inner', 'right_inner')
+        if not all(k in keypoints for k in req):
+            return None
+
+        io = _interocular(keypoints)
+        nose_y = float(np.asarray(keypoints['nose_bridge'], dtype=np.float32)[1])
+        left_brow_y  = float(np.asarray(keypoints['left_inner_brow'],  dtype=np.float32)[1])
+        right_brow_y = float(np.asarray(keypoints['right_inner_brow'], dtype=np.float32)[1])
+
+        # In screen coords y increases downward; brows *lowered* = larger y = closer to nose
+        # Activation = how close inner brows are to the nose bridge (normalised)
+        mean_dist = ((nose_y - left_brow_y) + (nose_y - right_brow_y)) * 0.5
+        return float(mean_dist / max(io, EPS))
+
+    @staticmethod
+    def _compute_au12_activation(keypoints):
+        """
+        AU12 (Lip Corner Puller): measures how far lip corners are
+        pulled up-and-outward relative to the upper lip centre,
+        normalised by inter-ocular distance.
+
+        Higher value → more smile / lip tension → greater AU12 activation.
+        All computation is in-memory vector math.
+        """
+        req = ('left_mouth_corner', 'right_mouth_corner', 'upper_lip_center',
+               'nose_tip', 'left_inner', 'right_inner')
+        if not all(k in keypoints for k in req):
+            return None
+
+        io = _interocular(keypoints)
+        lmc = np.asarray(keypoints['left_mouth_corner'],  dtype=np.float32)
+        rmc = np.asarray(keypoints['right_mouth_corner'], dtype=np.float32)
+        ulc = np.asarray(keypoints['upper_lip_center'],   dtype=np.float32)
+
+        # Vertical pull: lip corners rise above the upper lip centre (in screen y)
+        vert_pull = ((ulc[1] - lmc[1]) + (ulc[1] - rmc[1])) * 0.5
+        # Lateral spread: horizontal distance between mouth corners
+        lat_spread = float(np.linalg.norm(lmc[:2] - rmc[:2]))
+
+        activation = (vert_pull + lat_spread * 0.3) / max(io, EPS)
+        return float(activation)
+
+    # ── Velocity & Acceleration (finite differences over deque) ─────
+
+    def _compute_au_velocity(self, history):
+        """
+        First-order finite difference: velocity = activation[t] - activation[t-1].
+        Returns 0.0 if fewer than 2 samples.
+        """
+        if len(history) < 2:
+            return 0.0
+        return float(history[-1] - history[-2])
+
+    def _compute_au_acceleration(self, vel_history):
+        """
+        Second-order finite difference: acceleration = velocity[t] - velocity[t-1].
+        Returns 0.0 if fewer than 2 velocity samples.
+        """
+        if len(vel_history) < 2:
+            return 0.0
+        return float(vel_history[-1] - vel_history[-2])
+
+    def _detect_stress_spike(self, au4_vel, au4_acc, au12_vel, au12_acc):
+        """
+        Detect a 'Stress Spike' — the rapid onset phase of a micro-expression.
+
+        A spike fires when:
+          • AU4 velocity exceeds threshold (brows slamming down) AND acceleration
+            confirms it's an *onset* (not a sustained position), OR
+          • AU12 shows rapid change (lip tension snap).
+
+        Cooldown prevents spurious re-triggers from a single expression event.
+        """
+        if self._spike_cooldown > 0:
+            self._spike_cooldown -= 1
+            return False
+
+        au4_spike = (
+            abs(au4_vel) > AU4_VEL_SPIKE_THRESH
+            and abs(au4_acc) > AU_ACCEL_SPIKE_THRESH
+        )
+        au12_spike = (
+            abs(au12_vel) > AU12_VEL_SPIKE_THRESH
+            and abs(au12_acc) > AU_ACCEL_SPIKE_THRESH
+        )
+
+        if au4_spike or au12_spike:
+            self._spike_cooldown = SPIKE_COOLDOWN_FRAMES
+            return True
+        return False
+
+    def _update_au_temporal(self, keypoints):
+        """
+        Update the AU temporal buffers and compute velocities, accelerations,
+        and stress spike for the current frame.
+
+        Returns
+        -------
+        au4_vel, au4_acc, au12_vel, au12_acc : float
+            Current velocity and acceleration for each AU.
+        stress_spike : bool
+            Whether a micro-expression onset was detected this frame.
+        """
+        au4  = self._compute_au4_activation(keypoints)
+        au12 = self._compute_au12_activation(keypoints)
+
+        # Default values when landmarks are missing
+        au4_val  = au4  if au4  is not None else (self._au4_history[-1]  if self._au4_history  else 0.0)
+        au12_val = au12 if au12 is not None else (self._au12_history[-1] if self._au12_history else 0.0)
+
+        self._au4_history.append(au4_val)
+        self._au12_history.append(au12_val)
+
+        au4_vel  = self._compute_au_velocity(self._au4_history)
+        au12_vel = self._compute_au_velocity(self._au12_history)
+
+        self._au4_vel_history.append(au4_vel)
+        self._au12_vel_history.append(au12_vel)
+
+        au4_acc  = self._compute_au_acceleration(self._au4_vel_history)
+        au12_acc = self._compute_au_acceleration(self._au12_vel_history)
+
+        spike = self._detect_stress_spike(au4_vel, au4_acc, au12_vel, au12_acc)
+        self._last_stress_spike = spike
+
+        return au4_vel, au4_acc, au12_vel, au12_acc, spike
+
     # ── Helper: raw brow-eyelid distance ────────────────────────────
 
     def _raw_brow_eyelid_dist(self, keypoints):
@@ -269,13 +493,91 @@ class RealtimeAnalyzer:
         right_ear = self._eye_aspect_ratio(keypoints['right_eye_points'])
         return (left_ear + right_ear) * 0.5
 
+    # ── Biometric Gaze: Fixation & Saccade Tracking ─────────────────
+
+    def _update_fixation_saccade(self, gaze_vals, gaze_label):
+        """
+        Update fixation timer and saccade detector from current gaze ratios.
+
+        Fixation: consecutive frames where avg gaze stays within a
+        FIXATION_VARIANCE_THRESH corridor.  Duration in ms uses ASSUMED_FPS.
+
+        Saccade: a frame where gaze_avg *velocity* exceeds SACCADE_VEL_THRESH
+        AND the gaze zone has changed (Left→Right, Center→Off-screen, etc.).
+
+        All math is NumPy scalar ops → negligible overhead.
+
+        Returns
+        -------
+        fixation_dur_ms : float  – current fixation duration
+        saccade_rate    : float  – saccades per second in the recent window
+        """
+        lt = float(gaze_vals.get('left_t', 0.5))
+        rt = float(gaze_vals.get('right_t', 0.5))
+
+        # Clamp off-screen sentinels to 0.5 so they don't blow up variance
+        if lt < OFFSCREEN_LO or lt > OFFSCREEN_HI:
+            lt = 0.5
+        if rt < OFFSCREEN_LO or rt > OFFSCREEN_HI:
+            rt = 0.5
+
+        avg = (lt + rt) * 0.5
+        self._gaze_avg_ring.append(avg)
+
+        # ── Saccade detection ──────────────────────────────────────
+        saccade_this_frame = False
+        if self._prev_gaze_avg is not None:
+            vel = abs(avg - self._prev_gaze_avg)
+            zone_changed = (gaze_label != self._prev_gaze_zone
+                            and self._prev_gaze_zone is not None)
+            if vel > SACCADE_VEL_THRESH and zone_changed:
+                saccade_this_frame = True
+        self._prev_gaze_avg = avg
+        self._prev_gaze_zone = gaze_label
+
+        self._saccade_ring.append(1 if saccade_this_frame else 0)
+        n = len(self._saccade_ring)
+        if n >= 10:
+            self._saccade_rate = float(sum(self._saccade_ring)) * ASSUMED_FPS / float(n)
+        else:
+            self._saccade_rate = 0.0
+
+        # ── Fixation tracking ──────────────────────────────────────
+        if len(self._gaze_avg_ring) >= 3:
+            recent = np.asarray(self._gaze_avg_ring, dtype=np.float64)
+            # Use a slightly smaller window to compute instantaneous variance
+            var = float(np.var(recent[-min(len(recent), 10):])) 
+            if var <= FIXATION_VARIANCE_THRESH:
+                self._fixation_frames += 1
+            else:
+                self._fixation_frames = 0
+        else:
+            self._fixation_frames += 1  # not enough data yet — be generous
+
+        current_fix_ms = float(self._fixation_frames) * (1000.0 / ASSUMED_FPS)
+        
+        # Keep track of the *maximum* fixation achieved recently.
+        # This prevents penalizing natural eye movements (saccades) where
+        # instantaneous fixation drops to 0. We slowly decay the max duration.
+        if current_fix_ms > self._fixation_dur_ms:
+            self._fixation_dur_ms = current_fix_ms
+        else:
+            # Decay max fixation by ~100ms per second so it gradually drops 
+            # if the user becomes truly unstable, rather than instantly tanking.
+            self._fixation_dur_ms = max(0.0, self._fixation_dur_ms - (100.0 / ASSUMED_FPS))
+
+        return self._fixation_dur_ms, self._saccade_rate
+
     # ── Main update ─────────────────────────────────────────────────
 
     def _make_result(self, gaze_label, gaze_vals, stress_level, stress_score,
                      integrity, calibrating=False, calib_remaining=0, emotion='Neutral',
                      head_pose=(0.0, 0.0, 0.0), blink_bpm=0.0, blink_baseline_bpm=None,
                      blink_zscore=0.0, micro_tremor=0.0, emotional_distress=False,
-                     valence=0.0, arousal=0.0):
+                     valence=0.0, arousal=0.0,
+                     au4_vel=0.0, au4_acc=0.0, au12_vel=0.0, au12_acc=0.0,
+                     stress_spike=False,
+                     fixation_dur_ms=0.0, saccade_rate=0.0):
         """Uniform result dict for all return paths."""
         return {
             'gaze_label':           gaze_label,
@@ -294,6 +596,13 @@ class RealtimeAnalyzer:
             'emotional_distress':   bool(emotional_distress),
             'valence':              float(valence),
             'arousal':              float(arousal),
+            'au4_velocity':         float(au4_vel),
+            'au4_acceleration':     float(au4_acc),
+            'au12_velocity':        float(au12_vel),
+            'au12_acceleration':    float(au12_acc),
+            'stress_spike':         bool(stress_spike),
+            'fixation_dur_ms':      float(fixation_dur_ms),
+            'saccade_rate':         float(saccade_rate),
         }
 
     def _estimate_blink_bpm(self):
@@ -366,12 +675,20 @@ class RealtimeAnalyzer:
         Returns
         -------
         dict including gaze, stress, emotion, integrity, blink_bpm, micro_tremor,
-        emotional_distress, valence, arousal (V–A are heuristic proxies).
+        AU4/AU12 velocity & acceleration, stress_spike, emotional_distress,
+        valence, arousal (V–A are heuristic proxies).
         """
         hp = keypoints.get('head_pose', (0.0, 0.0, 0.0))
         rx, ry, rz = hp
 
         gaze_label, gaze_vals = self.gaze_head.predict(keypoints, frame)
+
+        # ── Biometric Gaze: fixation & saccade (every frame) ────────
+        fix_dur, sacc_rate = self._update_fixation_saccade(gaze_vals, gaze_label)
+
+        # ── AU Temporal Dynamics (run every frame, even pre-calibration) ─
+        au4_vel, au4_acc, au12_vel, au12_acc, stress_spike = \
+            self._update_au_temporal(keypoints)
 
         raw = self._raw_brow_eyelid_dist(keypoints)
         if raw is None:
@@ -379,6 +696,10 @@ class RealtimeAnalyzer:
             return self._make_result(
                 gaze_label, gaze_vals, 'Low', 0.0, self.prev_integrity,
                 emotion=emotion, head_pose=hp,
+                au4_vel=au4_vel, au4_acc=au4_acc,
+                au12_vel=au12_vel, au12_acc=au12_acc,
+                stress_spike=stress_spike,
+                fixation_dur_ms=fix_dur, saccade_rate=sacc_rate,
             )
 
         eye_open = self._eye_opening_ratio(keypoints)
@@ -413,6 +734,8 @@ class RealtimeAnalyzer:
             blink_z = self._blink_rate_zscore(bpm)
             blink_z_feat = float(np.clip(blink_z / 3.0, 0.0, 1.0))
 
+        # ── Temporal geometry vector (expanded with AU dynamics) ─────
+        spike_feat = 1.0 if stress_spike else 0.0
         temporal = (
             float(delta_brow_norm),
             float(blink_state),
@@ -421,6 +744,11 @@ class RealtimeAnalyzer:
             float(rx),
             float(ry),
             float(rz),
+            float(au4_vel),
+            float(au4_acc),
+            float(au12_vel),
+            float(au12_acc),
+            float(spike_feat),
         )
 
         emotion, ml_level, ml_score = self.affective_head.predict(
@@ -452,6 +780,10 @@ class RealtimeAnalyzer:
                 'Calibrating', gaze_vals, 'Low', 0.0, self.prev_integrity,
                 calibrating=True, calib_remaining=remaining, emotion=emotion,
                 head_pose=hp, blink_bpm=bpm, micro_tremor=micro_tremor,
+                au4_vel=au4_vel, au4_acc=au4_acc,
+                au12_vel=au12_vel, au12_acc=au12_acc,
+                stress_spike=stress_spike,
+                fixation_dur_ms=fix_dur, saccade_rate=sacc_rate,
             )
 
         delta = self._baseline_dist - raw
@@ -474,16 +806,24 @@ class RealtimeAnalyzer:
         if self.blink_suppress > 0:
             self.blink_suppress -= 1
             smooth = float(np.mean(self.stress_buf)) if self.stress_buf else ml_score
-            integrity = compute_integrity(self.prev_integrity, gaze_label, 'Low', smooth)
+            integrity = compute_integrity(
+                self.prev_integrity, gaze_label, 'Low', smooth,
+                fixation_dur_ms=fix_dur, saccade_rate=sacc_rate,
+                stress_spike=stress_spike,
+            )
             self.prev_integrity = integrity
             v, a = self._valence_arousal_proxy(emotion, smooth, micro_tremor, blink_z)
-            distress = blink_distress or tremor_distress or (smooth >= 0.65)
+            distress = blink_distress or tremor_distress or stress_spike or (smooth >= 0.65)
             return self._make_result(
                 gaze_label, gaze_vals, 'Low', smooth, integrity,
                 emotion=emotion, head_pose=hp, blink_bpm=bpm,
                 blink_baseline_bpm=self._blink_baseline_mu,
                 blink_zscore=blink_z, micro_tremor=micro_tremor,
                 emotional_distress=distress, valence=v, arousal=a,
+                au4_vel=au4_vel, au4_acc=au4_acc,
+                au12_vel=au12_vel, au12_acc=au12_acc,
+                stress_spike=stress_spike,
+                fixation_dur_ms=fix_dur, saccade_rate=sacc_rate,
             )
 
         if self.affective_head.feature_extractor is not None:
@@ -497,15 +837,27 @@ class RealtimeAnalyzer:
             else:
                 level = 'Low'
 
-        integrity = compute_integrity(self.prev_integrity, gaze_label, level, smooth)
+        # ── Stress spike boost: temporarily elevate stress on micro-expression onset
+        if stress_spike:
+            smooth = float(np.clip(smooth + 0.20, 0.0, 1.0))
+            if level == 'Low':
+                level = 'Medium'
+
+        integrity = compute_integrity(
+            self.prev_integrity, gaze_label, level, smooth,
+            fixation_dur_ms=fix_dur, saccade_rate=sacc_rate,
+            stress_spike=stress_spike,
+        )
         self.prev_integrity = integrity
 
         v, a = self._valence_arousal_proxy(emotion, smooth, micro_tremor, blink_z)
         distress = (
             blink_distress
             or tremor_distress
+            or stress_spike
             or (level == 'High')
             or (smooth >= 0.68)
+            or (fix_dur < FIXATION_MIN_DURATION_MS and sacc_rate > SACCADE_RATE_PENALTY_THRESH)
         )
 
         return self._make_result(
@@ -514,4 +866,8 @@ class RealtimeAnalyzer:
             blink_baseline_bpm=self._blink_baseline_mu,
             blink_zscore=blink_z, micro_tremor=micro_tremor,
             emotional_distress=distress, valence=v, arousal=a,
+            au4_vel=au4_vel, au4_acc=au4_acc,
+            au12_vel=au12_vel, au12_acc=au12_acc,
+            stress_spike=stress_spike,
+            fixation_dur_ms=fix_dur, saccade_rate=sacc_rate,
         )

@@ -7,8 +7,9 @@ import torchvision.transforms as transforms
 
 from train_affective_head import EmotionCNN, DEFAULT_EMBED_DIM
 
-# Deep embedding + temporal geometry: delta_brow, blink_state, micro_tremor, blink_z, pose×3
-TEMPORAL_DIM = 7
+# Deep embedding + temporal geometry: delta_brow, blink_state, micro_tremor,
+# blink_z, pose×3, au4_vel, au4_acc, au12_vel, au12_acc, stress_spike
+TEMPORAL_DIM = 12
 
 DEFAULT_CNN_PATH = os.path.join("models", "affective_cnn.pth")
 #  DISFA_CNN_PATH = os.path.join("models", "affective_cnn_disfa.pt") 

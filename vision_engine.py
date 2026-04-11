@@ -10,6 +10,7 @@ import numpy as np
 import time
 
 from landmark_indices import LEFT_IRIS, RIGHT_IRIS, IDX, LEFT_EYE_POINTS, RIGHT_EYE_POINTS
+from landmark_amplifier import LandmarkAmplifier
 
 # Try to support both MediaPipe solutions (classic) and the newer Tasks API.
 try:
@@ -35,6 +36,7 @@ class VisionEngine:
 
         self._mode = None
         self._engine = None
+        self._amplifier = LandmarkAmplifier()
 
         # ── Try classic solutions API first ─────────────────────────────
         if _mp is not None and hasattr(_mp, 'solutions'):
@@ -136,6 +138,9 @@ class VisionEngine:
                 raise RuntimeError(f'Failed to run MediaPipe Tasks FaceLandmarker: {e}')
         else:
             return None
+
+        # ── Signal Amplification (magnify subtle ROI landmark shifts) ──
+        lm = self._amplifier.amplify(lm)
 
         # ── Extract keypoints ───────────────────────────────────────────
         # Iris centres (mean of N iris landmarks per eye)

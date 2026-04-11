@@ -92,6 +92,16 @@ def draw_overlay(frame, kp, result, fps):
     a = result.get('arousal', 0.0)
     put(f'Blink: {bb:.1f}/min  z={bz:.2f}' + (f'  base~{bbl:.1f}' if bbl is not None else ''), scale=0.55, thickness=1)
     put(f'Micro-tremor: {mt:.2f}  V={v:+.2f} A={a:.2f}', scale=0.55, thickness=1)
+    au4v = result.get('au4_velocity', 0.0)
+    au12v = result.get('au12_velocity', 0.0)
+    spike = result.get('stress_spike', False)
+    spike_col = COL_RED if spike else (128, 128, 128)
+    put(f'AU4v:{au4v:+.3f} AU12v:{au12v:+.3f}', scale=0.5, thickness=1)
+    put(f'Stress Spike: {"DETECTED" if spike else "---"}', col=spike_col, scale=0.55, thickness=2)
+    fix_ms = result.get('fixation_dur_ms', 0.0)
+    sacc_r = result.get('saccade_rate', 0.0)
+    fix_col = COL_RED if fix_ms < 180.0 else COL_GREEN
+    put(f'Fixation: {fix_ms:.0f}ms  Saccade: {sacc_r:.1f}/s', col=fix_col, scale=0.5, thickness=1)
     dcol = COL_RED if distress else COL_GREEN
     put(f'Distress: {"YES" if distress else "no"}', col=dcol, scale=0.65, thickness=2)
     put(f'Integrity: {int(integrity)}', col=_integrity_colour(integrity))
@@ -212,6 +222,8 @@ def main():
                     'emotional_distress': False,
                     'valence': 0.0,
                     'arousal': 0.35,
+                    'fixation_dur_ms': 0.0,
+                    'saccade_rate': 0.0,
                 }
                 # If calibrating, keep showing calibration UI even if face blinks out
                 display_frame, is_calib = calibrator.update_and_draw((frame.shape[0], frame.shape[1]), None, frame, analyzer.gaze_head)

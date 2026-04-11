@@ -116,6 +116,10 @@ class GazeHead:
         """
         Returns categorical label for the integrity engine plus gaze_vals including
         continuous screen_x / screen_y from regression.
+
+        Label is derived from the raw iris projection ratios (geometric signal)
+        with head-pose compensation.  The ML model only provides the continuous
+        screen_x / screen_y regression for calibration purposes.
         """
         req = (
             "left_iris",
@@ -129,7 +133,7 @@ class GazeHead:
             self.patch_buffer.clear()
             return "Off-screen", {"left_t": -1.0, "right_t": -1.0}
 
-        from analytics import OFFSCREEN_HI, OFFSCREEN_LO, _proj_ratio
+        from analytics import OFFSCREEN_HI, OFFSCREEN_LO, CENTER_LO, CENTER_HI, _proj_ratio
 
         left_t = _proj_ratio(
             keypoints["left_iris"], keypoints["left_inner"], keypoints["left_outer"]
@@ -137,6 +141,16 @@ class GazeHead:
         right_t = _proj_ratio(
             keypoints["right_iris"], keypoints["right_inner"], keypoints["right_outer"]
         )
+
+        # ── Head-pose compensation (same logic as compute_gaze) ────────
+        hp = keypoints.get("head_pose", (0.0, 0.0, 0.0))
+        if hp is not None and len(hp) >= 2:
+            pitch, yaw = float(hp[0]), float(hp[1])
+            yaw_comp = float(np.clip(yaw * 0.006, -0.15, 0.15))
+            pitch_comp = float(np.clip(pitch * 0.003, -0.08, 0.08))
+            left_t += yaw_comp + pitch_comp
+            right_t += yaw_comp + pitch_comp
+
         gaze_vals = {"left_t": left_t, "right_t": right_t}
 
         if not (
@@ -146,21 +160,21 @@ class GazeHead:
             self.patch_buffer.clear()
             return "Off-screen", gaze_vals
 
+        # ── Categorical label from raw geometric ratios (ground truth) ─
+        avg = (left_t + right_t) * 0.5
+        if CENTER_LO <= avg <= CENTER_HI:
+            label = "Center"
+        elif avg < CENTER_LO:
+            label = "Left"
+        else:
+            label = "Right"
+
         if "left_eye_points" not in keypoints or "right_eye_points" not in keypoints:
-            avg = (left_t + right_t) * 0.5
-            label = (
-                "Center"
-                if 0.35 <= avg <= 0.65
-                else "Left"
-                if avg < 0.35
-                else "Right"
-            )
             return label, gaze_vals
 
         feature_vec = self._extract_geometric_features(keypoints)
         self.update_buffer(feature_vec)
 
-        hp = keypoints.get("head_pose", (0.0, 0.0, 0.0))
         pose_tensor = torch.tensor([[hp[0], hp[1], hp[2]]], dtype=torch.float32).to(
             self.device
         )
@@ -171,13 +185,7 @@ class GazeHead:
             pred = self.model(seq_tensor, head_pose=pose_tensor)
             x_norm, y_norm = pred[0].cpu().numpy()
 
-            if 0.35 <= x_norm <= 0.65:
-                label = "Center"
-            elif x_norm < 0.35:
-                label = "Left"
-            else:
-                label = "Right"
-
+            # ML provides continuous coordinates only (not the label)
             gaze_vals["screen_x"] = float(x_norm)
             gaze_vals["screen_y"] = float(y_norm)
 

@@ -34,6 +34,17 @@ RIGHT_EYE_POINTS = (362, 385, 387, 263, 373, 380)
 LEFT_EYEBROW  = 105
 RIGHT_EYEBROW = 334
 
+# ── AU4 (Brow Lowerer) — inner eyebrow points ─────────────────────
+LEFT_INNER_BROW  = 107   # medial left eyebrow
+RIGHT_INNER_BROW = 336   # medial right eyebrow
+NOSE_BRIDGE      = 6     # stable reference for vertical normalisation
+
+# ── AU12 (Lip Corner Puller / Zygomatic Major) ─────────────────────
+LEFT_MOUTH_CORNER  = 61
+RIGHT_MOUTH_CORNER = 291
+UPPER_LIP_CENTER   = 13   # philtrum centre
+NOSE_TIP           = 1    # stable reference for AU12 normalisation
+
 # ── Convenience dict for VisionEngine keypoint extraction ──────────
 IDX = {
     'left_outer':          LEFT_OUTER,
@@ -46,6 +57,15 @@ IDX = {
     'right_lower_eyelid':  RIGHT_LOWER_EYELID,
     'left_eyebrow':        LEFT_EYEBROW,
     'right_eyebrow':       RIGHT_EYEBROW,
+    # AU4 (Brow Lowerer) temporal dynamics
+    'left_inner_brow':     LEFT_INNER_BROW,
+    'right_inner_brow':    RIGHT_INNER_BROW,
+    'nose_bridge':         NOSE_BRIDGE,
+    # AU12 (Lip Corner Puller) temporal dynamics
+    'left_mouth_corner':   LEFT_MOUTH_CORNER,
+    'right_mouth_corner':  RIGHT_MOUTH_CORNER,
+    'upper_lip_center':    UPPER_LIP_CENTER,
+    'nose_tip':            NOSE_TIP,
 }
 
 # Total expected landmarks from refined face mesh
