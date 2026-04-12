@@ -10,6 +10,7 @@ fused with the affective CNN+TCN score.
 
 All processing is privacy-first and performed entirely in-memory.
 """
+import os
 import numpy as np
 from collections import deque
 
@@ -55,13 +56,20 @@ FIX_SHORT_PENALTY         = 0.5     # mild penalty when fixation duration < 180 
 SACCADE_STRESS_PENALTY    = 1.5     # penalty when high saccade rate during stress spike
 
 # ── Integrity tuning knobs ──────────────────────────────────────────
-INTEGRITY_DECAY       =  0.02   # tiny continuous decay per frame
-STRESS_WEIGHT         =  2.5    # penalty multiplier for stress score
-OFFSCREEN_PENALTY     =  6.0    # penalty when gaze is off-screen
-COMBO_PENALTY         = 15.0    # extra penalty: off-screen + high stress
-RECOVERY_REWARD       =  3.5    # reward when gaze is Center + stress Low
-RECOVERY_ONSCREEN     =  1.0    # smaller reward when gaze is on-screen (any stress)
-INTEGRITY_EMA_ALPHA   =  0.08   # EMA smoothing for integrity score (slower = more stable)
+INTEGRITY_DECAY       =  0.015  # tiny continuous decay per frame
+STRESS_WEIGHT         =  2.0    # penalty multiplier for stress score
+OFFSCREEN_PENALTY     =  5.0    # penalty when gaze is off-screen
+COMBO_PENALTY         = 12.0    # extra penalty: off-screen + high stress
+RECOVERY_REWARD       =  4.0    # reward when gaze is Center + stress Low
+RECOVERY_ONSCREEN     =  1.5    # smaller reward when gaze is on-screen (any stress)
+INTEGRITY_EMA_ALPHA   =  0.06   # EMA smoothing for integrity score (slower = more stable)
+
+# ── Advanced Integrity: Multi-Signal Fusion weights ─────────────────
+INTEGRITY_AU_SPIKE_PENALTY     = 2.0    # penalty when AU stress spike is detected
+INTEGRITY_TREMOR_PENALTY       = 1.5    # penalty for elevated micro-tremor
+INTEGRITY_BLINK_DISTRESS_PENALTY = 1.0  # penalty for abnormal blink rate
+INTEGRITY_FIXATION_REWARD_SCALE = 0.8   # reward scale for sustained fixation
+INTEGRITY_CONFIDENCE_WINDOW    = 30     # frames to build confidence in stable state
 
 
 def _proj_ratio(pt, a, b):
@@ -206,19 +214,37 @@ def compute_stress(keypoints):
 
 def compute_integrity(prev_score, gaze_label, stress_level, stress_score,
                       fixation_dur_ms=300.0, saccade_rate=0.0,
-                      stress_spike=False):
+                      stress_spike=False, micro_tremor=0.0,
+                      blink_distress=False, au4_vel=0.0, au12_vel=0.0):
     """
-    Real-time Integrity Score logic with biometric gaze adjustments.
+    Advanced Multi-Signal Integrity Engine with adaptive penalty scaling.
+
+    Fuses 7 independent signals into a single integrity score:
+      1. Gaze direction (on-screen vs off-screen)
+      2. Stress level & continuous score
+      3. Fixation duration (gaze stability)
+      4. Saccade rate (gaze instability)
+      5. AU micro-expression spikes (temporal dynamics)
+      6. Micro-tremor magnitude (somatic stress marker)
+      7. Blink-rate distress (autonomic stress marker)
+
+    Adaptive scaling: penalties intensify when multiple signals fire
+    simultaneously (compounding distress), while recovery rewards
+    scale with confidence (sustained calm state).
 
     Parameters
     ----------
-    prev_score      : float | None – previous score in 0..100 (None → start at 100)
-    gaze_label      : str
-    stress_level    : str
-    stress_score    : float
-    fixation_dur_ms : float – current fixation duration in milliseconds
-    saccade_rate    : float – saccades per second in the recent window
-    stress_spike    : bool  – whether a micro-expression stress spike is active
+    prev_score       : float | None – previous score in 0..100
+    gaze_label       : str
+    stress_level     : str
+    stress_score     : float
+    fixation_dur_ms  : float – current fixation duration in milliseconds
+    saccade_rate     : float – saccades per second
+    stress_spike     : bool  – micro-expression onset detected
+    micro_tremor     : float – normalised micro-tremor magnitude [0, 1]
+    blink_distress   : bool  – blink rate exceeds baseline by 1.5σ
+    au4_vel          : float – AU4 velocity (brow lowerer)
+    au12_vel         : float – AU12 velocity (lip corner puller)
 
     Returns
     -------
@@ -228,30 +254,78 @@ def compute_integrity(prev_score, gaze_label, stress_level, stress_score,
         prev_score = 100.0
 
     score = float(prev_score)
+
+    # ── Layer 1: Base decay ─────────────────────────────────────────
     score -= INTEGRITY_DECAY
+
+    # ── Layer 2: Stress-driven penalty (continuous) ─────────────────
     score -= float(stress_score) * STRESS_WEIGHT
 
+    # ── Layer 3: Gaze-driven penalties ──────────────────────────────
     if gaze_label == 'Off-screen':
         score -= OFFSCREEN_PENALTY
 
-    # Large penalty when both conditions fire simultaneously
+    # Combo penalty: off-screen AND high stress simultaneously
     if gaze_label == 'Off-screen' and stress_level == 'High':
         score -= COMBO_PENALTY
 
-    # ── Biometric gaze penalties ────────────────────────────────────
+    # ── Layer 4: Biometric gaze penalties ───────────────────────────
     # Short fixation: gaze instability → penalise
     if fixation_dur_ms < FIXATION_MIN_DURATION_MS:
-        score -= FIX_SHORT_PENALTY
+        # Adaptive: penalty scales with how far below the threshold we are
+        fix_deficit = 1.0 - (fixation_dur_ms / max(FIXATION_MIN_DURATION_MS, 1.0))
+        score -= FIX_SHORT_PENALTY * (1.0 + fix_deficit)
 
     # High saccade rate during stress spike → compounding penalty
-    if saccade_rate > SACCADE_RATE_PENALTY_THRESH and stress_spike:
-        score -= SACCADE_STRESS_PENALTY
+    if saccade_rate > SACCADE_RATE_PENALTY_THRESH:
+        saccade_excess = (saccade_rate - SACCADE_RATE_PENALTY_THRESH) / SACCADE_RATE_PENALTY_THRESH
+        base_saccade_pen = SACCADE_STRESS_PENALTY * (1.0 + min(saccade_excess, 2.0))
+        if stress_spike:
+            base_saccade_pen *= 1.5  # compounding when spike is active
+        score -= base_saccade_pen
 
-    # Recovery rewards
-    if gaze_label == 'Center' and stress_level == 'Low':
-        score += RECOVERY_REWARD       # full recovery: attentive + calm
-    elif gaze_label in ('Center', 'Left', 'Right'):
-        score += RECOVERY_ONSCREEN     # partial recovery: on-screen but stressed
+    # ── Layer 5: AU micro-expression onset penalty ──────────────────
+    if stress_spike:
+        score -= INTEGRITY_AU_SPIKE_PENALTY
+
+    # Rapid AU movement (even without full spike) contributes mild penalty
+    au_velocity_mag = abs(au4_vel) + abs(au12_vel)
+    if au_velocity_mag > 0.1:
+        score -= min(au_velocity_mag * 3.0, 2.0)
+
+    # ── Layer 6: Somatic / autonomic stress markers ─────────────────
+    if micro_tremor > MICRO_TREMOR_DISTRESS_THRESH:
+        score -= INTEGRITY_TREMOR_PENALTY * (micro_tremor / max(MICRO_TREMOR_DISTRESS_THRESH, 0.01))
+
+    if blink_distress:
+        score -= INTEGRITY_BLINK_DISTRESS_PENALTY
+
+    # ── Layer 7: Recovery rewards ───────────────────────────────────
+    # Count active distress signals for adaptive recovery
+    distress_signals = sum([
+        gaze_label == 'Off-screen',
+        stress_level in ('Medium', 'High'),
+        stress_spike,
+        micro_tremor > MICRO_TREMOR_DISTRESS_THRESH,
+        blink_distress,
+        saccade_rate > SACCADE_RATE_PENALTY_THRESH,
+    ])
+
+    if distress_signals == 0:
+        # Full recovery: no distress signals at all
+        if gaze_label == 'Center':
+            score += RECOVERY_REWARD
+        elif gaze_label in ('Left', 'Right'):
+            score += RECOVERY_ONSCREEN
+    elif distress_signals <= 1:
+        # Partial recovery: mostly calm
+        if gaze_label in ('Center', 'Left', 'Right'):
+            score += RECOVERY_ONSCREEN * 0.5
+
+    # Sustained fixation bonus: reward stable focused gaze
+    if fixation_dur_ms > 500.0 and gaze_label == 'Center':
+        fix_bonus = min((fixation_dur_ms - 500.0) / 2000.0, 1.0) * INTEGRITY_FIXATION_REWARD_SCALE
+        score += fix_bonus
 
     score = max(0.0, min(100.0, score))
 
@@ -278,8 +352,18 @@ class RealtimeAnalyzer:
         self.prev_integrity = 100.0
         
         # Load ML heads (graceful fallback inside if models missing)
-        self.gaze_head = GazeHead(seq_len=int(gaze_seq_len))
-        self.affective_head = AffectiveHead()
+        try:
+            import tflite_engine
+            if os.path.exists("models/affective_cnn_int8.tflite") and tflite_engine.HAS_TFLITE:
+                self.affective_head = tflite_engine.TFLiteAffectiveHead()
+                self.gaze_head = tflite_engine.TFLiteGazeHead(seq_len=int(gaze_seq_len))
+                print("[RealtimeAnalyzer] Successfully hooked High-Performance INT8 TFLite Engine.")
+            else:
+                self.gaze_head = GazeHead(seq_len=int(gaze_seq_len))
+                self.affective_head = AffectiveHead()
+        except ImportError:
+            self.gaze_head = GazeHead(seq_len=int(gaze_seq_len))
+            self.affective_head = AffectiveHead()
 
         # Calibration state
         self._calib_vals          = []
@@ -809,7 +893,9 @@ class RealtimeAnalyzer:
             integrity = compute_integrity(
                 self.prev_integrity, gaze_label, 'Low', smooth,
                 fixation_dur_ms=fix_dur, saccade_rate=sacc_rate,
-                stress_spike=stress_spike,
+                stress_spike=stress_spike, micro_tremor=micro_tremor,
+                blink_distress=blink_distress,
+                au4_vel=au4_vel, au12_vel=au12_vel,
             )
             self.prev_integrity = integrity
             v, a = self._valence_arousal_proxy(emotion, smooth, micro_tremor, blink_z)
@@ -826,7 +912,7 @@ class RealtimeAnalyzer:
                 fixation_dur_ms=fix_dur, saccade_rate=sacc_rate,
             )
 
-        if self.affective_head.feature_extractor is not None:
+        if hasattr(self.affective_head, 'feature_extractor') and self.affective_head.feature_extractor is not None:
             smooth = ml_score
             level = ml_level
         else:
@@ -846,7 +932,9 @@ class RealtimeAnalyzer:
         integrity = compute_integrity(
             self.prev_integrity, gaze_label, level, smooth,
             fixation_dur_ms=fix_dur, saccade_rate=sacc_rate,
-            stress_spike=stress_spike,
+            stress_spike=stress_spike, micro_tremor=micro_tremor,
+            blink_distress=blink_distress,
+            au4_vel=au4_vel, au12_vel=au12_vel,
         )
         self.prev_integrity = integrity
 

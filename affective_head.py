@@ -4,6 +4,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torchvision.transforms as transforms
+try:
+    import torch.ao.quantization
+except ImportError:
+    pass
 
 from train_affective_head import EmotionCNN, DEFAULT_EMBED_DIM
 
@@ -130,25 +134,39 @@ class AffectiveHead:
             print(f"[AffectiveHead] CNN not found at {cnn_path}.")
 
         tcn_path = "models/stress_tcn.pth"
+        tcn_int8_path = "models/affective_tcn_int8.pth"
+        
         self.tcn = MultiModalStressTCN(
             seq_len=self.seq_len, embed_dim=self.embed_dim
         ).to(self.device)
         self.feature_buffer = []
 
-        if os.path.exists(tcn_path):
+        if self.device.type == "cpu" and os.path.exists(tcn_int8_path):
             try:
-                try:
-                    tstate = torch.load(
-                        tcn_path, map_location=self.device, weights_only=True
-                    )
-                except TypeError:
-                    tstate = torch.load(tcn_path, map_location=self.device)
-                self.tcn.load_state_dict(tstate, strict=True)
-                print("[AffectiveHead] Loaded stress TCN.")
-            except Exception:
-                print(
-                    "[AffectiveHead] stress_tcn.pth mismatch or missing — using random TCN (retrain recommended)."
+                self.tcn = torch.ao.quantization.quantize_dynamic(
+                    self.tcn, {torch.nn.Linear}, dtype=torch.qint8
                 )
+                tstate = torch.load(tcn_int8_path, map_location=self.device, weights_only=True)
+                self.tcn.load_state_dict(tstate, strict=True)
+                print("[AffectiveHead] Loaded INT8 dynamically quantized stress TCN.")
+            except Exception as e:
+                print(f"[AffectiveHead] Failed to load INT8 TCN, falling back to FP32: {e}")
+                self._load_fp32_tcn(tcn_path)
+        elif os.path.exists(tcn_path):
+            self._load_fp32_tcn(tcn_path)
+        else:
+            print("[AffectiveHead] stress_tcn.pth missing — using random TCN.")
+
+    def _load_fp32_tcn(self, tcn_path):
+        try:
+            try:
+                tstate = torch.load(tcn_path, map_location=self.device, weights_only=True)
+            except TypeError:
+                tstate = torch.load(tcn_path, map_location=self.device)
+            self.tcn.load_state_dict(tstate, strict=True)
+            print("[AffectiveHead] Loaded stress TCN (FP32).")
+        except Exception:
+            print("[AffectiveHead] stress_tcn.pth mismatch or missing — using random TCN.")
 
     def predict(self, keypoints, frame=None, temporal_geometries=None):
         """

@@ -2,6 +2,10 @@ import os
 import numpy as np
 import torch
 import torch.nn as nn
+try:
+    import torch.ao.quantization
+except ImportError:
+    pass
 import torch.optim as optim
 
 from gaze_geometry import (
@@ -67,25 +71,38 @@ class GazeHead:
         self.seq_len = int(seq_len)
         self.input_dim = int(input_dim)
         self.model_path = model_path
+        self.int8_path = "models/gaze_hybrid_int8.pth"
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = HybridGazeModel(seq_len=self.seq_len, input_dim=self.input_dim).to(self.device)
 
         self.patch_buffer = []
 
-        if os.path.exists(model_path):
+        if self.device.type == "cpu" and os.path.exists(self.int8_path):
             try:
-                try:
-                    state = torch.load(
-                        model_path, map_location=self.device, weights_only=True
-                    )
-                except TypeError:
-                    state = torch.load(model_path, map_location=self.device)
+                self.model = torch.ao.quantization.quantize_dynamic(
+                    self.model, {torch.nn.Linear}, dtype=torch.qint8
+                )
+                state = torch.load(self.int8_path, map_location=self.device, weights_only=True)
                 self.model.load_state_dict(state, strict=True)
-                print("[GazeHead] Loaded gaze regression weights.")
+                print("[GazeHead] Loaded INT8 dynamically quantized gaze regression weights.")
             except Exception as e:
-                print(f"[GazeHead] Could not load {model_path} ({e}). Using random init.")
+                print(f"[GazeHead] Failed to load INT8 gaze model, falling back to FP32: {e}")
+                self._load_fp32(model_path)
+        elif os.path.exists(model_path):
+            self._load_fp32(model_path)
         else:
             print(f"[GazeHead] No weights at {model_path}; random init.")
+
+    def _load_fp32(self, model_path):
+        try:
+            try:
+                state = torch.load(model_path, map_location=self.device, weights_only=True)
+            except TypeError:
+                state = torch.load(model_path, map_location=self.device)
+            self.model.load_state_dict(state, strict=True)
+            print("[GazeHead] Loaded gaze regression weights (FP32).")
+        except Exception as e:
+            print(f"[GazeHead] Could not load {model_path} ({e}). Using random init.")
             os.makedirs(os.path.dirname(model_path) or ".", exist_ok=True)
 
         self.optimizer = optim.SGD(self.model.parameters(), lr=0.01)
