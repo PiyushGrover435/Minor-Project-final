@@ -1,9 +1,10 @@
 import os
+import cv2
 import numpy as np
 
 # Attempt to load TFLite runtime or full TensorFlow
 try:
-    import tflite_runtime.interpreter as tflite
+    import tflite_runtime.interpreter as tflite  # type: ignore
     HAS_TFLITE = True
 except ImportError:
     try:
@@ -97,7 +98,14 @@ class TFLiteAffectiveHead:
         self.feature_buffer = []
         self.seq_len = 15
         
-        print("[TFLiteInferenceEngine] Initialized AffectiveHead (INT8).")
+        # Dynamically determine embed_dim from the TFLite model output shape
+        self.embed_dim = 256
+        if self.cnn_engine is not None and len(self.cnn_engine.output_details) > 0:
+            out_shape = self.cnn_engine.output_details[0]['shape']
+            if len(out_shape) > 1:
+                self.embed_dim = int(out_shape[-1])
+        
+        print(f"[TFLiteInferenceEngine] Initialized AffectiveHead (INT8) with embed_dim={self.embed_dim}.")
         
     def predict(self, keypoints, frame=None, temporal_geometries=None):
         emotion = 'Neutral'
@@ -119,12 +127,25 @@ class TFLiteAffectiveHead:
                 face_tensor = (face_resized.astype(np.float32) / 255.0 - 0.5) / 0.5
                 face_tensor = np.reshape(face_tensor, (1, 1, 48, 48))
                 
-                # Execute INT8 inference
-                cnn_out = self.cnn_engine.infer(face_tensor)[0] # shape (1, 512)
+                # Execute INT8 inference returning both emotion probs and the embedding
+                outputs = self.cnn_engine.infer(face_tensor)
+                
+                # Depending on TF internal tensor ordering, shape [7] is probs, [embed_dim] is the feature
+                if outputs[0].size == 7:
+                    probs, cnn_out = outputs[0][0], outputs[1][0]
+                else:
+                    cnn_out, probs = outputs[0][0], outputs[1][0]
+                
+                # Apply softmax equivalent and extract emotion label
+                emotion_idx = int(np.argmax(probs))
+                emotion = self.idx_to_class.get(emotion_idx, 'Neutral').capitalize()
+                
+                # Ensure it's correctly shaped as (1, 256)
+                cnn_out = cnn_out.reshape(1, self.embed_dim)
             else:
-                cnn_out = np.zeros((1, 512), dtype=np.float32)
+                cnn_out = np.zeros((1, self.embed_dim), dtype=np.float32)
         else:
-            cnn_out = np.zeros((1, 512), dtype=np.float32)
+            cnn_out = np.zeros((1, self.embed_dim), dtype=np.float32)
             
         temp_data = temporal_geometries if temporal_geometries else (0.0,) * TEMPORAL_DIM
         temp_arr = np.array(temp_data, dtype=np.float32).reshape(1, TEMPORAL_DIM)
@@ -175,9 +196,12 @@ class TFLiteGazeHead:
             hp = keypoints.get('head_pose', (0.0, 0.0, 0.0))
             seq_arr = np.array(self.feature_buffer, dtype=np.float32).reshape(1, self.seq_len, 10)
             pose_arr = np.array(hp, dtype=np.float32).reshape(1, 3)
-            
             # Execute INT8 Hybrid Inference
-            out = self.engine.infer(seq_arr, pose_arr)[0]
+            # TF Lite often reorders inputs alphabetically or by graph logic. We map by shape.
+            if self.engine.input_details[0]['shape'][-1] == 3:
+                out = self.engine.infer(pose_arr, seq_arr)[0]
+            else:
+                out = self.engine.infer(seq_arr, pose_arr)[0]
             gaze_vals['screen_x'] = float(out[0][0])
             gaze_vals['screen_y'] = float(out[0][1])
             gaze_vals['confidence'] = 0.95

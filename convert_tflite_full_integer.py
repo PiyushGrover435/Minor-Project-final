@@ -107,12 +107,12 @@ def build_affective_cnn_keras(embed_dim=256):
 
     # Classifier
     x = tf.keras.layers.Flatten()(x)
-    x = tf.keras.layers.Dense(embed_dim, name='fc1')(x)
-    x = tf.keras.layers.ReLU()(x)
+    embedding = tf.keras.layers.Dense(embed_dim, name='fc1')(x)
+    x = tf.keras.layers.ReLU()(embedding)
     x = tf.keras.layers.Dropout(0.5)(x)
     out = tf.keras.layers.Dense(7, name='fc_out')(x)
 
-    return tf.keras.Model(inp, out, name="AffectiveCNN")
+    return tf.keras.Model(inp, [out, embedding], name="AffectiveCNN")
 
 
 def transfer_cnn_weights(keras_model, pt_state):
@@ -128,7 +128,17 @@ def transfer_cnn_weights(keras_model, pt_state):
     _transfer_bn(keras_model.get_layer('bn13'), pt_state, 'features.13')
 
     # Dense: classifier.1 → fc1, classifier.4 → fc_out
-    _transfer_dense(keras_model.get_layer('fc1'),    pt_state['classifier.1.weight'], pt_state['classifier.1.bias'])
+    # Fix PyTorch (C,H,W) to Keras (H,W,C) Flatten mismatch!
+    w_fc1 = pt_state['classifier.1.weight'].detach().cpu().numpy() # (256, 4608)
+    # PyTorch features output is (128, 6, 6)
+    w_fc1 = w_fc1.reshape(w_fc1.shape[0], 128, 6, 6)
+    # Transpose to match Keras Flatten from Conv2D(channels_last) which is (H, W, C)
+    w_fc1 = np.transpose(w_fc1, (0, 2, 3, 1))
+    w_fc1 = w_fc1.reshape(w_fc1.shape[0], -1) 
+    
+    layer_fc1 = keras_model.get_layer('fc1')
+    layer_fc1.set_weights([w_fc1.T, pt_state['classifier.1.bias'].detach().cpu().numpy()])
+    
     _transfer_dense(keras_model.get_layer('fc_out'), pt_state['classifier.4.weight'], pt_state['classifier.4.bias'])
 
 

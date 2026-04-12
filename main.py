@@ -162,7 +162,7 @@ def main():
         return
 
     engine   = VisionEngine()
-    analyzer = RealtimeAnalyzer(window=12, calib_frames=30, gaze_seq_len=18)
+    analyzer = RealtimeAnalyzer(window=12, calib_frames=30, gaze_seq_len=15)
     integrity = analyzer.prev_integrity
     calibrator = CalibrationEngine()
     smoother  = KeypointSmoother()
