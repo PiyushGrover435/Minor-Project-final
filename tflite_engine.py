@@ -86,7 +86,7 @@ class TFLiteInferenceEngine:
 # ============================================================================
 
 from affective_head import TEMPORAL_DIM
-from gaze_geometry import extract_gaze_feature_vector
+from gaze_geometry import extract_gaze_feature_vector, compensate_head_pose
 
 class TFLiteAffectiveHead:
     """Seamless drop-in replacement for PyTorch AffectiveHead using TFLite INT8."""
@@ -113,14 +113,18 @@ class TFLiteAffectiveHead:
         stress_score = 0.0
         
         # We need the frame to extract CNN features
-        if frame is not None and self.cnn_engine is not None and 'bbox' in keypoints:
-            x, y, w, h = keypoints['bbox']
-            # Safeguard bounds
-            x = max(0, x); y = max(0, y)
-            w = min(w, frame.shape[1] - x); h = min(h, frame.shape[0] - y)
-            
-            if w > 10 and h > 10:
-                face_img = frame[y:y+h, x:x+w]
+        if frame is not None and self.cnn_engine is not None and 'face_bbox' in keypoints:
+            x_min, y_min, x_max, y_max = keypoints['face_bbox']
+            # Add padding around the face crop
+            w, h = x_max - x_min, y_max - y_min
+            pad_x, pad_y = int(w * 0.2), int(h * 0.2)
+            x_min = max(0, x_min - pad_x)
+            y_min = max(0, y_min - pad_y)
+            x_max = min(frame.shape[1], x_max + pad_x)
+            y_max = min(frame.shape[0], y_max + pad_y)
+
+            face_img = frame[y_min:y_max, x_min:x_max]
+            if face_img.size > 0 and face_img.shape[0] > 10 and face_img.shape[1] > 10:
                 # Preprocess matches PyTorch transforms
                 face_gray = cv2.cvtColor(face_img, cv2.COLOR_BGR2GRAY)
                 face_resized = cv2.resize(face_gray, (48, 48))
@@ -140,7 +144,7 @@ class TFLiteAffectiveHead:
                 emotion_idx = int(np.argmax(probs))
                 emotion = self.idx_to_class.get(emotion_idx, 'Neutral').capitalize()
                 
-                # Ensure it's correctly shaped as (1, 256)
+                # Ensure it's correctly shaped as (1, embed_dim)
                 cnn_out = cnn_out.reshape(1, self.embed_dim)
             else:
                 cnn_out = np.zeros((1, self.embed_dim), dtype=np.float32)
@@ -220,11 +224,7 @@ class TFLiteGazeHead:
         right_t = _proj_ratio(keypoints['right_iris'], keypoints['right_inner'], keypoints['right_outer'])
         
         hp = keypoints.get('head_pose', (0.0, 0.0, 0.0))
-        if hp is not None and len(hp) >= 2:
-            yaw_comp = float(np.clip(hp[1] * 0.006, -0.15, 0.15))
-            pitch_comp = float(np.clip(hp[0] * 0.003, -0.08, 0.08))
-            left_t += yaw_comp + pitch_comp
-            right_t += yaw_comp + pitch_comp
+        left_t, right_t = compensate_head_pose(left_t, right_t, hp)
             
         gaze_vals = {'left_t': left_t, 'right_t': right_t}
         if not (OFFSCREEN_LO <= left_t <= OFFSCREEN_HI and OFFSCREEN_LO <= right_t <= OFFSCREEN_HI):

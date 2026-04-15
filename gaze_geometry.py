@@ -16,6 +16,45 @@ import numpy as np
 
 EPS = 1e-6
 
+# ── Head-pose compensation constants ───────────────────────────────────
+# Degrees of yaw/pitch that shift the gaze ratio toward center per degree,
+# preventing false off-screen alerts when the user merely shifts their head.
+_YAW_COMP_PER_DEG   = 0.006   # ~0.6% per degree of yaw
+_PITCH_COMP_PER_DEG = 0.003   # ~0.3% per degree of pitch
+_MAX_YAW_COMP       = 0.15    # cap total yaw compensation
+_MAX_PITCH_COMP     = 0.08    # cap total pitch compensation
+
+
+def compensate_head_pose(left_t: float, right_t: float,
+                         head_pose: tuple) -> Tuple[float, float]:
+    """Apply yaw/pitch compensation to iris projection ratios.
+
+    When the head rotates, the iris projection shifts even when the user is
+    still fixating on the screen.  This nudges the ratio back toward centre
+    proportionally.
+
+    Parameters
+    ----------
+    left_t, right_t : float
+        Raw iris projection ratios for left and right eyes.
+    head_pose : tuple
+        (pitch, yaw, roll) in degrees from solvePnP.
+
+    Returns
+    -------
+    (left_t, right_t) : tuple[float, float]
+        Compensated projection ratios.
+    """
+    if head_pose is not None and len(head_pose) >= 2:
+        pitch, yaw = float(head_pose[0]), float(head_pose[1])
+        yaw_comp = float(np.clip(yaw * _YAW_COMP_PER_DEG,
+                                 -_MAX_YAW_COMP, _MAX_YAW_COMP))
+        pitch_comp = float(np.clip(pitch * _PITCH_COMP_PER_DEG,
+                                   -_MAX_PITCH_COMP, _MAX_PITCH_COMP))
+        left_t += yaw_comp + pitch_comp
+        right_t += yaw_comp + pitch_comp
+    return left_t, right_t
+
 # Per-channel multipliers on the raw 10-D vector (iris-from-inner, iris-from-outer, EARs).
 DEFAULT_SPATIAL_WEIGHTS = np.array(
     [1.6, 1.6, 1.6, 1.6, 0.55, 0.55, 0.55, 0.55, 0.85, 0.85], dtype=np.float32

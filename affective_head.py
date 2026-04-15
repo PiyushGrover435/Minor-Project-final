@@ -9,6 +9,8 @@ try:
 except ImportError:
     pass
 
+import sys
+sys.path.append(os.path.join(os.path.dirname(__file__), 'scripts'))
 from train_affective_head import EmotionCNN, DEFAULT_EMBED_DIM
 
 # Deep embedding + temporal geometry: delta_brow, blink_state, micro_tremor,

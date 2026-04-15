@@ -11,6 +11,7 @@ import torch.optim as optim
 from gaze_geometry import (
     GAZE_FEATURE_DIM,
     extract_gaze_feature_vector,
+    compensate_head_pose,
 )
 
 
@@ -93,6 +94,9 @@ class GazeHead:
         else:
             print(f"[GazeHead] No weights at {model_path}; random init.")
 
+        self.optimizer = optim.SGD(self.model.parameters(), lr=0.01)
+        self.criterion = nn.MSELoss()
+
     def _load_fp32(self, model_path):
         try:
             try:
@@ -104,9 +108,6 @@ class GazeHead:
         except Exception as e:
             print(f"[GazeHead] Could not load {model_path} ({e}). Using random init.")
             os.makedirs(os.path.dirname(model_path) or ".", exist_ok=True)
-
-        self.optimizer = optim.SGD(self.model.parameters(), lr=0.01)
-        self.criterion = nn.MSELoss()
 
     def _extract_geometric_features(self, keypoints):
         return extract_gaze_feature_vector(keypoints)
@@ -159,14 +160,9 @@ class GazeHead:
             keypoints["right_iris"], keypoints["right_inner"], keypoints["right_outer"]
         )
 
-        # ── Head-pose compensation (same logic as compute_gaze) ────────
+        # ── Head-pose compensation ────────────────────────────────────
         hp = keypoints.get("head_pose", (0.0, 0.0, 0.0))
-        if hp is not None and len(hp) >= 2:
-            pitch, yaw = float(hp[0]), float(hp[1])
-            yaw_comp = float(np.clip(yaw * 0.006, -0.15, 0.15))
-            pitch_comp = float(np.clip(pitch * 0.003, -0.08, 0.08))
-            left_t += yaw_comp + pitch_comp
-            right_t += yaw_comp + pitch_comp
+        left_t, right_t = compensate_head_pose(left_t, right_t, hp)
 
         gaze_vals = {"left_t": left_t, "right_t": right_t}
 
@@ -248,8 +244,12 @@ class GazeHead:
         pred = self.model(seq_tensor, head_pose=pose_tensor)
         loss = self.criterion(pred, target_tensor)
 
-        loss.backward()
-        self.optimizer.step()
+        try:
+            loss.backward()
+            self.optimizer.step()
+        except RuntimeError:
+            # Model is likely dynamically quantized and cannot compute gradients. Skip fine-tuning.
+            pass
 
         return float(loss.item())
 

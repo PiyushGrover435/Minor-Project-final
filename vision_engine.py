@@ -12,6 +12,21 @@ import time
 from landmark_indices import LEFT_IRIS, RIGHT_IRIS, IDX, LEFT_EYE_POINTS, RIGHT_EYE_POINTS
 from landmark_amplifier import LandmarkAmplifier
 
+# ── Head Pose: Canonical 3D face model points (generic human face proportions) ──
+# These correspond to MediaPipe landmark indices:
+#   1  = Nose tip       152 = Chin
+#   33 = Left eye outer  263 = Right eye outer
+#   61 = Left mouth      291 = Right mouth
+_MODEL_3D = np.array([
+    (0.0,    0.0,    0.0),      # Nose tip
+    (0.0,   -63.6,  -12.5),     # Chin
+    (-43.3,  32.7,  -26.0),     # Left eye outer
+    (43.3,   32.7,  -26.0),     # Right eye outer
+    (-28.9, -28.9,  -24.1),     # Left mouth
+    (28.9,  -28.9,  -24.1),     # Right mouth
+], dtype=np.float64)
+_POSE_IDX = [1, 152, 33, 263, 61, 291]
+
 # Try to support both MediaPipe solutions (classic) and the newer Tasks API.
 try:
     import mediapipe as _mp
@@ -169,25 +184,7 @@ class VisionEngine:
         }
         
         # ── Head Pose Estimation (6-DOF via solvePnP) ──────────────────
-        #
-        # Canonical 3D face model points (generic human face proportions).
-        # These correspond to MediaPipe landmark indices:
-        #   1  = Nose tip
-        #   152 = Chin
-        #   33  = Left eye outer corner
-        #   263 = Right eye outer corner
-        #   61  = Left mouth corner
-        #   291 = Right mouth corner
-        _MODEL_3D = np.array([
-            (0.0,    0.0,    0.0),      # Nose tip
-            (0.0,   -63.6,  -12.5),     # Chin
-            (-43.3,  32.7,  -26.0),     # Left eye outer
-            (43.3,   32.7,  -26.0),     # Right eye outer
-            (-28.9, -28.9,  -24.1),     # Left mouth
-            (28.9,  -28.9,  -24.1),     # Right mouth
-        ], dtype=np.float64)
-        _POSE_IDX = [1, 152, 33, 263, 61, 291]
-
+        # Uses module-level _MODEL_3D and _POSE_IDX constants.
         try:
             image_pts = np.array([lm[i] for i in _POSE_IDX], dtype=np.float64)  # Nx2 pixel
 
