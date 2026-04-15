@@ -16,6 +16,7 @@ FER-2013/
 calibration_data/
 *.csv
 *.jsonl
+synopsis.txt
 
 # Ignore heavy PyTorch & ONNX files (We ONLY push the lightweight edge TFLite files to Github!)
 models/*.pth

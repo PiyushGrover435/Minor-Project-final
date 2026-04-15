@@ -36,7 +36,7 @@ if (-not $pythonCmd) {
 Write-Host "Using Python command: $pythonCmd"
 
 # Create venv
-& $pythonCmd -m venv .venv
+Invoke-Expression "$pythonCmd -m venv .venv"
 if ($LASTEXITCODE -ne 0) { Write-Host "Failed to create virtualenv" -ForegroundColor Red; exit 1 }
 
 Write-Host "To activate the venv run: .\.venv\Scripts\Activate.ps1"
@@ -57,4 +57,4 @@ if ($LASTEXITCODE -ne 0) { Write-Host "Failed to install requirements in virtual
 
 Write-Host "Setup complete. To activate and run the app:" -ForegroundColor Green
 Write-Host "  .\.venv\Scripts\Activate.ps1" -ForegroundColor Green
-Write-Host "  python sentin_edge.py" -ForegroundColor Green
+Write-Host "  python main.py" -ForegroundColor Green
