@@ -1,40 +1,24 @@
-# Python bytecode and cache
+# Sentin-Edge AI .gitignore
 __pycache__/
 *.py[cod]
-*$py.class
-
-# Virtual environments
 .venv/
 venv/
-env/
-
-# Build and packaging
-build/
-dist/
-*.egg-info/
-
-# Test and coverage artifacts
 .pytest_cache/
-.coverage
-.coverage.*
-htmlcov/
-
-# Logs and local runtime files
-*.log
-
-# Editor and OS files
 .vscode/
 .idea/
 .DS_Store
-Thumbs.db
 
-# Notebook checkpoints
-.ipynb_checkpoints/
-
-# Datasets and processed data
+# Ignore massive raw datasets and scratch files
+Dataset/
+data/scratch/
 MPIIGAZE/
 FER-2013/
-Dataset/
+calibration_data/
 *.csv
 *.jsonl
-*.task
+
+# Ignore heavy PyTorch & ONNX files (We ONLY push the lightweight edge TFLite files to Github!)
+models/*.pth
+models/*.pt
+models/*.onnx
+models/*_saved_model/
