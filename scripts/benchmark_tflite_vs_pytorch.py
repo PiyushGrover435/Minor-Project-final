@@ -1,7 +1,11 @@
 import os
+import sys
 import time
 import numpy as np
 import torch
+
+# Ensure the root directory is in the import path
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from affective_head import AffectiveHead, TEMPORAL_DIM
 from gaze_head import GazeHead
@@ -27,9 +31,9 @@ def check_variance(fp32_output, tflite_output, name="Model"):
         
     print(f"[{name}] Output Variance (MAE): {mae:.5f} | Relative Error: {pct_variance:.2f}%")
     if pct_variance < 5.0:
-        print(f"[{name}] ✅ INT8 Quantization variance is WITHIN the 5% margin constraints.")
+        print(f"[{name}] [PASS] INT8 Quantization variance is WITHIN the 5% margin constraints.")
     else:
-        print(f"[{name}] ❌ WARNING: INT8 Quantization exceeds 5% variance baseline.")
+        print(f"[{name}] [FAIL] WARNING: INT8 Quantization exceeds 5% variance baseline.")
 
 def benchmark_inference(model_call, inputs, runs=500):
     """Measures latency of a loaded model over multiple runs."""
@@ -110,7 +114,15 @@ def main():
     # Gaze Variance
     with torch.no_grad(): # PyTorch Gaze reqs transpose logic in forward
         pt_gaze_out = pt_gaze.model(pt_gaze_seq, pt_gaze_pose).numpy()
-    tf_gaze_out = tf_gaze.engine.infer(np_gaze_seq, np_gaze_pose)[0] if tf_gaze.engine else np.zeros((1,2))
+    
+    if tf_gaze.engine:
+        if tf_gaze.engine.input_details[0]['shape'][-1] == 3:
+            tf_gaze_out = tf_gaze.engine.infer(np_gaze_pose, np_gaze_seq)[0]
+        else:
+            tf_gaze_out = tf_gaze.engine.infer(np_gaze_seq, np_gaze_pose)[0]
+    else:
+        tf_gaze_out = np.zeros((1,2))
+        
     check_variance(pt_gaze_out, tf_gaze_out, "Gaze Hybrid Regression")
 
 
@@ -125,7 +137,11 @@ def main():
     def tf_tcn_call(): tf_aff.tcn_engine.infer(np_temp_seq)
     
     def pt_gaze_call(): pt_gaze.model(pt_gaze_seq, pt_gaze_pose)
-    def tf_gaze_call(): tf_gaze.engine.infer(np_gaze_seq, np_gaze_pose)
+    def tf_gaze_call():
+        if tf_gaze.engine.input_details[0]['shape'][-1] == 3:
+            tf_gaze.engine.infer(np_gaze_pose, np_gaze_seq)
+        else:
+            tf_gaze.engine.infer(np_gaze_seq, np_gaze_pose)
 
     pt_cnn_lat = benchmark_inference(pt_cnn_call, []) if pt_aff.feature_extractor else 0
     tf_cnn_lat = benchmark_inference(tf_cnn_call, []) if tf_aff.cnn_engine else 0
